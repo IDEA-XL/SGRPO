@@ -40,7 +40,21 @@ python -m pip install "setuptools<81"
 pip install -r env/requirements.txt
 pip install -e .
 pip install scikit-learn==1.2.2
+pip install \
+  accelerate==1.13.0 \
+  deepspeed==0.16.7 \
+  ninja==1.13.0 \
+  pytorch-lightning==2.6.1 \
+  torch-geometric==2.7.0
+pip install \
+  torch-scatter==2.1.2+pt26cu124 \
+  -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
 
 if [[ "${INSTALL_MM_PROGEN2_DEPS}" == "1" ]]; then
-  pip install fair-esm==2.0.0 lmdb biotite scipy requests
+  pip install \
+    fair-esm==2.0.0 \
+    lmdb==2.2.0 \
+    biotite==1.2.0 \
+    scipy==1.15.3 \
+    requests==2.33.1
 fi

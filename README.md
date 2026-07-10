@@ -75,7 +75,9 @@ SGRPO/
 
 ## Environment
 
-The supported environment is Python 3.10 with the dependencies installed by `env/setup.sh`.
+The final experiments used Linux x86-64, Python 3.10, PyTorch 2.6.0 with the CUDA 12.4 runtime, Transformers 4.52.4, Accelerate 1.13.0, and DeepSpeed 0.16.7. The supported recreation path is `env/setup.sh`; it installs the molecular, pocket-based, and protein dependencies used by the training and sweep pipelines.
+
+The host must provide an NVIDIA driver compatible with CUDA 12.4. A local CUDA toolkit is not required for the small-molecule workflows, but it is required later when compiling the OpenFold extension for the protein workflow.
 
 ```bash
 git clone <YOUR_GITHUB_URL>/SGRPO.git
@@ -83,6 +85,7 @@ cd SGRPO
 
 source "$(conda info --base)/etc/profile.d/conda.sh"
 export CONDA_ENV_NAME=sgrpo
+export INSTALL_MM_PROGEN2_DEPS=1
 bash env/setup.sh
 conda activate "${CONDA_ENV_NAME}"
 ```
@@ -98,11 +101,41 @@ conda activate "${CONDA_ENV_PREFIX}"
 
 `env/setup.sh` performs the following steps:
 
-- creates a fresh Python 3.10 environment
+- creates a fresh Python 3.10 environment with `pip==23.3.1`
 - installs the base repo requirements from `env/requirements.txt`
 - installs the repo in editable mode
+- installs the Accelerate, DeepSpeed, PyTorch Geometric, and CUDA-12.4-compatible `torch-scatter` versions used by the final runs
 - installs the extra packages needed by the pocket-based and ProGen2 pipelines
 - pins `setuptools<81` so that `wandb==0.13.5` remains importable
+
+Verify the recreated base environment before downloading model and dataset assets:
+
+```bash
+python - <<'PY'
+import accelerate
+import deepspeed
+import torch
+import transformers
+
+expected = {
+    "torch": "2.6.0",
+    "transformers": "4.52.4",
+    "accelerate": "1.13.0",
+    "deepspeed": "0.16.7",
+}
+actual = {
+    "torch": torch.__version__.split("+")[0],
+    "transformers": transformers.__version__,
+    "accelerate": accelerate.__version__,
+    "deepspeed": deepspeed.__version__,
+}
+if actual != expected:
+    raise RuntimeError(f"Environment version mismatch: expected={expected}, actual={actual}")
+print(actual)
+PY
+```
+
+Uni-Dock is intentionally installed into its own Conda environment, and the protein workflow uses a repo-local Python overlay plus a repo-local CUDA 12.4 compiler toolchain. Those two additions are described in their respective asset sections below; they are not hidden dependencies of the base environment.
 
 ## One-Time Assets
 
@@ -313,10 +346,24 @@ git clone https://github.com/aqlaboratory/openfold.git \
 python scripts/setup_progen2_python_overlay.py \
   --overlay-dir runs/progen2_models/python_overlay
 
+conda create -y \
+  -p runs/progen2_models/cuda_toolchain_cu124 \
+  -c nvidia/label/cuda-12.4.1 \
+  cuda-nvcc cuda-cudart-dev cuda-libraries-dev
+
+export CUDA_HOME="$(pwd)/runs/progen2_models/cuda_toolchain_cu124"
+export PATH="${CUDA_HOME}/bin:${PATH}"
+export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${CUDA_HOME}/targets/x86_64-linux/lib:${LD_LIBRARY_PATH:-}"
+
+test -x "${CUDA_HOME}/bin/nvcc"
+test -f "${CUDA_HOME}/include/cusparse.h"
+
 python scripts/setup_openfold_extension.py \
   --source-dir runs/progen2_models/openfold_official \
   --overlay-dir runs/progen2_models/python_overlay
 ```
+
+The OpenFold extension is compiled against the active PyTorch environment and must therefore be rebuilt if the PyTorch or CUDA minor version changes.
 
 #### TemBERTure
 

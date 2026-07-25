@@ -57,6 +57,7 @@ class GroupSpec:
     job_name: str
     output_pattern: Path
     error_pattern: Path
+    time_limit: str | None = None
     exports: tuple[tuple[str, str], ...] = ()
 
 
@@ -173,6 +174,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
             job_name="rbdenovo",
             output_pattern=LOG_ROOT / "denovo_%A_%a.out",
             error_pattern=LOG_ROOT / "denovo_%A_%a.err",
+            time_limit="01:00:00",
         ),
     )
     denovo_keys = []
@@ -242,6 +244,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 job_name=f"rbmmg{seed}",
                 output_pattern=LOG_ROOT / f"mm_generate_seed{seed}_%A_%a.out",
                 error_pattern=LOG_ROOT / f"mm_generate_seed{seed}_%A_%a.err",
+                time_limit="01:00:00",
                 exports=(("TASKS_PATH", str(tasks_path)), ("SEED", str(seed))),
             ),
         )
@@ -351,6 +354,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 job_name=f"rbp2g{seed}",
                 output_pattern=LOG_ROOT / f"p2_generate_seed{seed}_%A_%a.out",
                 error_pattern=LOG_ROOT / f"p2_generate_seed{seed}_%A_%a.err",
+                time_limit="01:00:00",
                 exports=(("CONFIG_PATH", str(config_path)), ("MODE", "generate-task")),
             ),
         )
@@ -363,6 +367,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 job_name=f"rbp2n{seed}",
                 output_pattern=LOG_ROOT / f"p2_naturalness_seed{seed}_%j.out",
                 error_pattern=LOG_ROOT / f"p2_naturalness_seed{seed}_%j.err",
+                time_limit="01:00:00",
                 exports=(
                     ("CONFIG_PATH", str(config_path)),
                     ("MODE", "score-packed-gpu-reward"),
@@ -379,6 +384,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 job_name=f"rbp2s{seed}",
                 output_pattern=LOG_ROOT / f"p2_stability_seed{seed}_%j.out",
                 error_pattern=LOG_ROOT / f"p2_stability_seed{seed}_%j.err",
+                time_limit="01:00:00",
                 exports=(
                     ("CONFIG_PATH", str(config_path)),
                     ("MODE", "score-packed-gpu-reward"),
@@ -395,6 +401,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 job_name=f"rbp2f{seed}",
                 output_pattern=LOG_ROOT / f"p2_foldability_seed{seed}_%A_%a.out",
                 error_pattern=LOG_ROOT / f"p2_foldability_seed{seed}_%A_%a.err",
+                time_limit="01:00:00",
                 exports=(
                     ("CONFIG_PATH", str(config_path)),
                     ("MODE", "score-point-reward-task"),
@@ -727,6 +734,8 @@ def _submit_group(
     ]
     if array_ids != [None]:
         command.append("--array=" + ",".join(str(array_id) for array_id in array_ids))
+    if group.time_limit is not None:
+        command.append(f"--time={group.time_limit}")
     if group.exports:
         command.append(f"--export={_export_option(group.exports)}")
     command.append(str(group.script))

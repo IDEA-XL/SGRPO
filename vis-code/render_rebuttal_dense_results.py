@@ -846,7 +846,7 @@ def plot_figure2(
         columnspacing=1.25,
         handletextpad=0.55,
     )
-    figure.subplots_adjust(left=0.075, right=0.995, top=0.88, bottom=0.23, wspace=0.18)
+    figure.subplots_adjust(left=0.105, right=0.995, top=0.88, bottom=0.23, wspace=0.18)
     figure.savefig(output_path)
     plt.close(figure)
 
@@ -1029,12 +1029,17 @@ def _plot_hv_curve(
     )
 
 
-def _annotate_grpo(axis: plt.Axes, x_value: float, y_value: float, x_offset: float) -> None:
-    y_span = axis.get_ylim()[1] - axis.get_ylim()[0]
+def _annotate_grpo(
+    axis: plt.Axes,
+    x_value: float,
+    y_value: float,
+    text_x: float,
+    text_y: float,
+) -> None:
     axis.annotate(
         "GRPO",
         xy=(x_value, y_value),
-        xytext=(x_value + x_offset, y_value + 0.08 * y_span),
+        xytext=(text_x, text_y),
         ha="center",
         va="bottom",
         color="#333333",
@@ -1075,8 +1080,20 @@ def plot_figure5(
     axes[1].set_xticklabels(["0", "0.1", "0.3", "0.5", "0.7", "0.9"])
     axes[0].yaxis.set_major_formatter(FormatStrFormatter("%.3f"))
     axes[1].yaxis.set_major_formatter(FormatStrFormatter("%.3f"))
-    _annotate_grpo(axes[0], group_x[0], group_mean[0], x_offset=8.0)
-    _annotate_grpo(axes[1], weight_x[0], weight_mean[0], x_offset=0.12)
+    _annotate_grpo(
+        axes[0],
+        group_x[0],
+        group_mean[0],
+        text_x=10.7,
+        text_y=group_mean[0] + 0.0006,
+    )
+    _annotate_grpo(
+        axes[1],
+        weight_x[0],
+        weight_mean[0],
+        text_x=0.13,
+        text_y=weight_mean[0] + 0.0011,
+    )
     figure.subplots_adjust(left=0.08, right=0.995, bottom=0.22, top=0.98, wspace=0.20)
     figure.savefig(output_path)
     plt.close(figure)

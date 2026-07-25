@@ -186,6 +186,7 @@ MAIN_PANELS = (
         ),
     ),
 )
+REBUTTAL_PANELS = MAIN_PANELS[:2]
 
 ABLATION_MODELS = (
     ModelSpec(
@@ -222,12 +223,15 @@ DIVERSITY_WEIGHT_SPECS = (
 
 
 class ResultStore:
-    def __init__(self, results_root: Path):
+    def __init__(self, results_root: Path, source_kinds: Iterable[str]):
         self.results_root = results_root
         self._cache: dict[tuple[str, int], list[dict]] = {}
+        kinds = tuple(source_kinds)
+        if not kinds:
+            raise ValueError("At least one result source is required")
         missing = [
             self._path(kind, seed)
-            for kind in ("denovo", "mmgenmol", "progen2")
+            for kind in kinds
             for seed in SEEDS
             if not self._path(kind, seed).is_file()
         ]
@@ -410,24 +414,30 @@ def aggregate_series(store: ResultStore, panel: PanelSpec, model: ModelSpec) -> 
     return aggregate
 
 
-def validate_seed_independence(store: ResultStore) -> None:
+def validate_seed_independence(
+    store: ResultStore, panels: tuple[PanelSpec, ...]
+) -> None:
     panel_models = [
-        (panel, model) for panel in MAIN_PANELS for model in panel.models
+        (panel, model) for panel in panels for model in panel.models
     ]
-    denovo_experiments = {
-        model.source_id for model in ABLATION_MODELS
-    } | {
-        spec.experiment for spec in (*GROUP_SIZE_SPECS, *DIVERSITY_WEIGHT_SPECS)
-    }
-    denovo_panel = MAIN_PANELS[0]
-    known_denovo = {model.source_id for model in denovo_panel.models}
-    panel_models.extend(
-        (
-            denovo_panel,
-            ModelSpec(experiment, experiment, "", "o"),
-        )
-        for experiment in sorted(denovo_experiments - known_denovo)
+    denovo_panel = next(
+        (panel for panel in panels if panel.source_kind == "denovo"),
+        None,
     )
+    if denovo_panel is not None:
+        denovo_experiments = {
+            model.source_id for model in ABLATION_MODELS
+        } | {
+            spec.experiment for spec in (*GROUP_SIZE_SPECS, *DIVERSITY_WEIGHT_SPECS)
+        }
+        known_denovo = {model.source_id for model in denovo_panel.models}
+        panel_models.extend(
+            (
+                denovo_panel,
+                ModelSpec(experiment, experiment, "", "o"),
+            )
+            for experiment in sorted(denovo_experiments - known_denovo)
+        )
     for panel, model in panel_models:
         signatures = []
         for seed in SEEDS:
@@ -505,10 +515,11 @@ def compute_r2(points: Iterable[Point]) -> float:
 
 def table1_metrics(
     store: ResultStore,
+    panels: tuple[PanelSpec, ...],
 ) -> tuple[dict[str, dict[str, tuple[float, float]]], dict[str, list[Point]]]:
     output: dict[str, dict[str, tuple[float, float]]] = {}
     references: dict[str, list[Point]] = {}
-    for panel in MAIN_PANELS:
+    for panel in panels:
         per_model_values = {
             model.label: {"HV": [], "DIP": [], "R2": []} for model in panel.models
         }
@@ -759,14 +770,16 @@ def _draw_main_panel(axis: plt.Axes, store: ResultStore, panel: PanelSpec) -> No
             )
 
 
-def _main_legend_handles() -> list[Line2D]:
+def _main_legend_handles(panels: tuple[PanelSpec, ...]) -> list[Line2D]:
     unique = {}
-    for panel in MAIN_PANELS:
+    for panel in panels:
         for model in panel.models:
             unique.setdefault(model.label, model)
     handles = []
     for label in ("Original", "GRPO", "SGRPO", "Memory-Assisted GRPO"):
-        model = unique[label]
+        model = unique.get(label)
+        if model is None:
+            continue
         handles.append(
             Line2D(
                 [0],
@@ -806,16 +819,25 @@ def _main_legend_handles() -> list[Line2D]:
     return handles
 
 
-def plot_figure2(store: ResultStore, output_path: Path) -> None:
+def plot_figure2(
+    store: ResultStore,
+    output_path: Path,
+    panels: tuple[PanelSpec, ...],
+) -> None:
     configure_style(UNIFORM_FONT_SIZE)
-    figure, axes = plt.subplots(1, 3, figsize=(18.6, 6.1))
+    figure, axes = plt.subplots(
+        1,
+        len(panels),
+        figsize=(6.2 * len(panels), 6.1),
+        squeeze=False,
+    )
     figure.patch.set_facecolor("white")
-    for axis, panel in zip(axes, MAIN_PANELS):
+    for axis, panel in zip(axes[0], panels):
         _draw_main_panel(axis, store, panel)
     figure.supxlabel("Utility", y=0.086)
     figure.supylabel("Diversity", x=0.017)
     figure.legend(
-        handles=_main_legend_handles(),
+        handles=_main_legend_handles(panels),
         loc="lower center",
         bbox_to_anchor=(0.5, -0.015),
         ncol=6,
@@ -1072,6 +1094,7 @@ def _format_point(value: float) -> str:
 def _append_main_metric_tables(
     lines: list[str],
     metrics: dict[str, dict[str, tuple[float, float]]],
+    panels: tuple[PanelSpec, ...],
 ) -> None:
     lines.extend(
         [
@@ -1081,7 +1104,7 @@ def _append_main_metric_tables(
             "",
         ]
     )
-    for panel in MAIN_PANELS:
+    for panel in panels:
         model_by_label = {model.label: model for model in panel.models}
         ordered_labels = ["Original", "GRPO"]
         if "Memory-Assisted GRPO" in model_by_label:
@@ -1111,7 +1134,9 @@ def _append_main_metric_tables(
 
 
 def _append_reference_table(
-    lines: list[str], references: dict[str, list[Point]]
+    lines: list[str],
+    references: dict[str, list[Point]],
+    panels: tuple[PanelSpec, ...],
 ) -> None:
     lines.extend(
         [
@@ -1121,7 +1146,7 @@ def _append_reference_table(
             "|---|---:|---:|---:|",
         ]
     )
-    panel_by_key = {panel.key: panel for panel in MAIN_PANELS}
+    panel_by_key = {panel.key: panel for panel in panels}
     for panel_key, points in references.items():
         for seed, point in zip(SEEDS, points):
             lines.append(
@@ -1131,7 +1156,11 @@ def _append_reference_table(
     lines.append("")
 
 
-def _append_figure2_tables(lines: list[str], store: ResultStore) -> None:
+def _append_figure2_tables(
+    lines: list[str],
+    store: ResultStore,
+    panels: tuple[PanelSpec, ...],
+) -> None:
     lines.extend(
         [
             "## Figure 2: Utility-Diversity Operating Points",
@@ -1140,7 +1169,7 @@ def _append_figure2_tables(lines: list[str], store: ResultStore) -> None:
             "",
         ]
     )
-    for panel in MAIN_PANELS:
+    for panel in panels:
         lines.extend(
             [
                 f"### {panel.title}",
@@ -1233,12 +1262,12 @@ def write_markdown(
     references: dict[str, list[Point]],
     group_result: tuple[list[float], list[float], list[float], Point],
     weight_result: tuple[list[float], list[float], list[float], Point],
+    panels: tuple[PanelSpec, ...],
 ) -> None:
     molecule_points = ", ".join(
         f"({randomness:g}, {temperature:g})"
         for randomness, temperature in MOLECULE_SWEEP
     )
-    progen2_points = ", ".join(f"{temperature:g}" for temperature in PROGEN2_TEMPERATURES)
     lines = [
         "# Expanded Sweeping Evaluation Results",
         "",
@@ -1251,12 +1280,11 @@ def write_markdown(
         "|---|---|---:|---:|",
         f"| GenMol de novo | `{molecule_points}` | 5 | 1,000 |",
         f"| GenMol-P / mmGenMol | `{molecule_points}` | 5 | 1,600 |",
-        f"| ProGen2 | `{progen2_points}` | 5 | 512 |",
         "",
     ]
-    _append_main_metric_tables(lines, metrics)
-    _append_reference_table(lines, references)
-    _append_figure2_tables(lines, store)
+    _append_main_metric_tables(lines, metrics, panels)
+    _append_reference_table(lines, references, panels)
+    _append_figure2_tables(lines, store, panels)
     _append_figure3_table(lines, store)
     _append_figure5_tables(lines, group_result, weight_result)
     output_path.write_text("\n".join(lines) + "\n")
@@ -1279,14 +1307,18 @@ def main() -> None:
     args = parse_args()
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    store = ResultStore(args.results_root)
-    validate_seed_independence(store)
-    metrics, references = table1_metrics(store)
+    panels = REBUTTAL_PANELS
+    store = ResultStore(
+        args.results_root,
+        tuple(panel.source_kind for panel in panels),
+    )
+    validate_seed_independence(store, panels)
+    metrics, references = table1_metrics(store, panels)
     figure2_path = output_dir / "figure2.pdf"
     figure3_path = output_dir / "figure3.pdf"
     figure5_path = output_dir / "figure5.pdf"
     markdown_path = output_dir / "expanded-sweep-results.md"
-    plot_figure2(store, figure2_path)
+    plot_figure2(store, figure2_path, panels)
     plot_figure3(store, figure3_path)
     group_result, weight_result = plot_figure5(store, figure5_path)
     write_markdown(
@@ -1296,6 +1328,7 @@ def main() -> None:
         references,
         group_result,
         weight_result,
+        panels,
     )
     print(figure2_path)
     print(figure3_path)

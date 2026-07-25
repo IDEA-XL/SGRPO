@@ -627,7 +627,7 @@ def _accounting_states(job_ids: Iterable[str]) -> dict[tuple[str, int | None], t
                 "-P",
                 "-j",
                 job_id,
-                "--format=JobIDRaw,State,ExitCode",
+                "--format=JobID,State,ExitCode",
             ],
             check=True,
             capture_output=True,
@@ -636,16 +636,16 @@ def _accounting_states(job_ids: Iterable[str]) -> dict[tuple[str, int | None], t
         for line in result.stdout.splitlines():
             if not line.strip():
                 continue
-            raw_id, raw_state, exit_code = line.split("|", 2)
-            if "." in raw_id:
+            logical_id, raw_state, exit_code = line.split("|", 2)
+            if "." in logical_id:
                 continue
-            if "_" in raw_id:
-                base_id, array_value = raw_id.split("_", 1)
+            if "_" in logical_id:
+                base_id, array_value = logical_id.split("_", 1)
                 if not array_value.isdigit():
                     continue
                 key = (base_id, int(array_value))
-            elif raw_id.isdigit():
-                key = (raw_id, None)
+            elif logical_id.isdigit():
+                key = (logical_id, None)
             else:
                 continue
             state_name = raw_state.split()[0].rstrip("+")

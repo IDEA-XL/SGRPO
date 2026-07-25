@@ -273,7 +273,12 @@ def _build_denovo_specs(spec_root: Path) -> None:
             )
             task_id += 1
     with manifest_path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), delimiter="\t")
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=rows[0].keys(),
+            delimiter="\t",
+            lineterminator="\n",
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -306,7 +311,12 @@ def _build_mmgenmol_specs(spec_root: Path) -> None:
                 task_id += 1
         task_path.parent.mkdir(parents=True, exist_ok=True)
         with task_path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), delimiter="\t")
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=rows[0].keys(),
+                delimiter="\t",
+                lineterminator="\n",
+            )
             writer.writeheader()
             writer.writerows(rows)
 
@@ -436,7 +446,12 @@ def _build_progen2_specs(spec_root: Path) -> None:
                 task_id += 1
         task_path.parent.mkdir(parents=True, exist_ok=True)
         with task_path.open("w", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=rows[0].keys(), delimiter="\t")
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=rows[0].keys(),
+                delimiter="\t",
+                lineterminator="\n",
+            )
             writer.writeheader()
             writer.writerows(rows)
 

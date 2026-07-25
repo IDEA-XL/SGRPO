@@ -30,6 +30,8 @@ COMPLETE_PATH = RUN_OUTPUT_ROOT / "COMPLETE"
 GPU_MAX_SUBMITTED_JOBS = 40
 GPU_TASKS_PER_GROUP_PER_ROUND = 4
 POLL_SECONDS = 60
+DOMAIN_ENV = "REBUTTAL_DOMAINS"
+SUPPORTED_DOMAINS = ("denovo", "mmgenmol", "progen2")
 
 DOCKING_CACHE_DIR = Path(
     "/public/home/xinwuye/ai4s-tool-joint-train/runs/pocket_prefix_eval/"
@@ -135,6 +137,7 @@ def _clean_submission_environment() -> dict[str, str]:
         "SEED",
         "TASK_ID",
         "TASKS_PATH",
+        DOMAIN_ENV,
     ):
         environment.pop(name, None)
     return environment
@@ -158,6 +161,33 @@ def _add_task(tasks: dict[str, TaskSpec], task: TaskSpec) -> None:
     if task.key in tasks:
         raise ValueError(f"Duplicate task: {task.key}")
     tasks[task.key] = task
+
+
+def _task_domain(task_key: str) -> str:
+    if task_key.startswith("denovo:"):
+        return "denovo"
+    if task_key.startswith("mm:"):
+        return "mmgenmol"
+    if task_key.startswith("p2:"):
+        return "progen2"
+    raise ValueError(f"Cannot determine domain for task: {task_key}")
+
+
+def _active_domains() -> tuple[str, ...]:
+    raw_value = os.environ.get(DOMAIN_ENV)
+    if raw_value is None:
+        return SUPPORTED_DOMAINS
+    domains = tuple(part.strip() for part in raw_value.split(",") if part.strip())
+    if not domains:
+        raise ValueError(f"{DOMAIN_ENV} must contain at least one domain")
+    invalid = sorted(set(domains) - set(SUPPORTED_DOMAINS))
+    if invalid:
+        raise ValueError(
+            f"Unsupported {DOMAIN_ENV} values: {invalid}; expected {SUPPORTED_DOMAINS}"
+        )
+    if len(set(domains)) != len(domains):
+        raise ValueError(f"{DOMAIN_ENV} contains duplicate domains: {domains}")
+    return domains
 
 
 def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, ...]]:
@@ -666,8 +696,9 @@ def _refresh_task_states(
     active_jobs: set[tuple[str, int | None]],
 ) -> None:
     submitted_job_ids = [
-        entry["job_id"]
-        for entry in state["tasks"].values()
+        state["tasks"][key]["job_id"]
+        for key in tasks
+        if (entry := state["tasks"].get(key))
         if entry.get("status") == "submitted"
     ]
     accounting = _accounting_states(submitted_job_ids)
@@ -875,13 +906,26 @@ def main() -> None:
     except BlockingIOError as exc:
         raise RuntimeError("Another rebuttal sweep controller is already running") from exc
 
-    groups, tasks, terminal_keys = _build_dag()
-    state = _load_state(tasks)
+    groups, all_tasks, all_terminal_keys = _build_dag()
+    state = _load_state(all_tasks)
+    active_domains = _active_domains()
+    tasks = {
+        key: task
+        for key, task in all_tasks.items()
+        if _task_domain(key) in active_domains
+    }
+    terminal_keys = tuple(
+        key for key in all_terminal_keys if _task_domain(key) in active_domains
+    )
+    if not tasks or not terminal_keys:
+        raise RuntimeError(f"No tasks selected for domains: {active_domains}")
     state["status"] = "running"
+    state["active_domains"] = list(active_domains)
     state["controller_restarted_at_epoch"] = time.time()
     _atomic_write_state(state)
     print(
-        f"controller_start groups={len(groups)} tasks={len(tasks)} "
+        f"controller_start domains={','.join(active_domains)} "
+        f"groups={len(groups)} tasks={len(tasks)} "
         f"gpu_submit_limit={GPU_MAX_SUBMITTED_JOBS}",
         flush=True,
     )

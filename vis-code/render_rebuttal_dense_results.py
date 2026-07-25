@@ -263,6 +263,12 @@ class ResultStore:
                 _molecule_key(row["randomness"], row["generation_temperature"]): row
                 for row in subset
             }
+            _validate_exact_sweep_keys(
+                row_by_point,
+                subset,
+                {_molecule_key(*point) for point in MOLECULE_SWEEP},
+                context=f"de novo seed={seed} model={model.source_id}",
+            )
             return [
                 RunPoint(
                     point_label=_molecule_label(randomness, temperature),
@@ -276,6 +282,12 @@ class ResultStore:
             row_by_point = {
                 _molecule_key(row["randomness"], row["temperature"]): row for row in subset
             }
+            _validate_exact_sweep_keys(
+                row_by_point,
+                subset,
+                {_molecule_key(*point) for point in MOLECULE_SWEEP},
+                context=f"mmGenMol seed={seed} model={model.source_id}",
+            )
             series = []
             for randomness, temperature in MOLECULE_SWEEP:
                 row = row_by_point[_molecule_key(randomness, temperature)]
@@ -295,6 +307,12 @@ class ResultStore:
         if panel.source_kind == "progen2":
             subset = [row for row in rows if row["experiment"] == model.source_id]
             row_by_temperature = {round(float(row["temperature"]), 4): row for row in subset}
+            _validate_exact_sweep_keys(
+                row_by_temperature,
+                subset,
+                {round(temperature, 4) for temperature in PROGEN2_TEMPERATURES},
+                context=f"ProGen2 seed={seed} model={model.source_id}",
+            )
             return [
                 RunPoint(
                     point_label=f"T={temperature:.2f}",
@@ -320,6 +338,24 @@ def _finite(value: object) -> float:
     if not math.isfinite(converted):
         raise ValueError(f"Expected finite value, got {value!r}")
     return converted
+
+
+def _validate_exact_sweep_keys(
+    row_by_key: dict,
+    source_rows: list[dict],
+    expected_keys: set,
+    *,
+    context: str,
+) -> None:
+    actual_keys = set(row_by_key)
+    if len(source_rows) != len(row_by_key):
+        raise ValueError(f"Duplicate sweep rows for {context}")
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise ValueError(
+            f"Sweep grid mismatch for {context}: missing={missing}, unexpected={unexpected}"
+        )
 
 
 def _molecule_key(randomness: object, temperature: object) -> tuple[float, float]:
@@ -372,6 +408,41 @@ def aggregate_series(store: ResultStore, panel: PanelSpec, model: ModelSpec) -> 
             )
         )
     return aggregate
+
+
+def validate_seed_independence(store: ResultStore) -> None:
+    panel_models = [
+        (panel, model) for panel in MAIN_PANELS for model in panel.models
+    ]
+    denovo_experiments = {
+        model.source_id for model in ABLATION_MODELS
+    } | {
+        spec.experiment for spec in (*GROUP_SIZE_SPECS, *DIVERSITY_WEIGHT_SPECS)
+    }
+    denovo_panel = MAIN_PANELS[0]
+    known_denovo = {model.source_id for model in denovo_panel.models}
+    panel_models.extend(
+        (
+            denovo_panel,
+            ModelSpec(experiment, experiment, "", "o"),
+        )
+        for experiment in sorted(denovo_experiments - known_denovo)
+    )
+    for panel, model in panel_models:
+        signatures = []
+        for seed in SEEDS:
+            series = store.series(panel, model, seed)
+            signatures.append(
+                tuple(
+                    (round(point.utility, 12), round(point.diversity, 12))
+                    for point in series
+                )
+            )
+        if len(set(signatures)) != len(SEEDS):
+            raise ValueError(
+                f"Non-independent or duplicated seed-level sweep summaries for "
+                f"{panel.source_kind} / {model.source_id}"
+            )
 
 
 def strictly_dominates(left: Point, right: Point) -> bool:
@@ -1209,6 +1280,7 @@ def main() -> None:
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     store = ResultStore(args.results_root)
+    validate_seed_independence(store)
     metrics, references = table1_metrics(store)
     figure2_path = output_dir / "figure2.pdf"
     figure3_path = output_dir / "figure3.pdf"

@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 SACCT = Path("/opt/gridview/slurm/bin/sacct")
+SCONTROL = Path("/opt/gridview/slurm/bin/scontrol")
 RUNS_ROOT = Path("/public/home/xinwuye/ai4s-tool-joint-train/runs")
 DEFAULT_OUTPUT_DIR = RUNS_ROOT / "baseline_expansion_monitor"
 SWEEP_ROOT = RUNS_ROOT / "baseline_expansion_sweep"
@@ -185,6 +186,22 @@ def _normalize_state(value: str) -> str:
     return value.split()[0].rstrip("+")
 
 
+def _query_job_io_paths(job_id: int) -> tuple[str, str]:
+    result = subprocess.run(
+        [str(SCONTROL), "show", "job", "-o", str(job_id)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return "", ""
+    stdout_match = re.search(r"(?:^|\s)StdOut=(\S+)", result.stdout)
+    stderr_match = re.search(r"(?:^|\s)StdErr=(\S+)", result.stdout)
+    stdout = stdout_match.group(1) if stdout_match is not None else ""
+    stderr = stderr_match.group(1) if stderr_match is not None else ""
+    return stdout, stderr
+
+
 def _query_jobs(job_ids: list[int]) -> dict[int, dict]:
     result = subprocess.run(
         [
@@ -216,6 +233,10 @@ def _query_jobs(job_ids: list[int]) -> dict[int, dict]:
         )
         if job_id not in expected:
             continue
+        if not stdout or not stderr:
+            live_stdout, live_stderr = _query_job_io_paths(int(job_id))
+            stdout = stdout or live_stdout
+            stderr = stderr or live_stderr
         records[int(job_id)] = {
             "state": _normalize_state(state),
             "exit_code": exit_code,
@@ -604,6 +625,8 @@ def main() -> None:
     args = _parse_args()
     if not SACCT.is_file():
         raise FileNotFoundError(f"Missing Slurm accounting executable: {SACCT}")
+    if not SCONTROL.is_file():
+        raise FileNotFoundError(f"Missing Slurm control executable: {SCONTROL}")
     specs = _build_specs(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     status_path = args.output_dir / "status.json"

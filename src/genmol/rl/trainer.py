@@ -4,7 +4,7 @@ import math
 import os
 import re
 from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
 import torch
@@ -29,6 +29,7 @@ from genmol.rl.policy import GenMolCpGRPOPolicy
 from genmol.rl.reward import (
     MOLECULAR_REWARD_NAME_ORDER,
     MolecularReward,
+    RewardRecord,
     compute_internal_diversity,
     compute_internal_diversity_loo_credits,
     normalize_molecular_reward_weights,
@@ -41,6 +42,11 @@ from genmol.rl.specs import (
     serialize_specs,
 )
 from rl_shared.hbd import build_molecule_hbd_memory, validate_hbd_config
+from rl_shared.diverse_minibatch import (
+    optimization_group_size,
+    select_molecule_groups,
+    validate_diverse_minibatch_config,
+)
 from rl_shared.sampling import normalize_scalar_or_range
 
 
@@ -108,6 +114,9 @@ class TrainConfig:
     hbd_bucket_size: int = 25
     hbd_score_threshold_for_memory: float = 0.6
     hbd_similarity_cutoff: float = 0.6
+    diverse_minibatch: bool = False
+    diverse_minibatch_oversample_factor: int = 2
+    entropy_regularization_weight: float = 0.0
 
 
 @dataclass
@@ -157,6 +166,15 @@ def load_config(path):
         raise ValueError('group_advantage_weight must be in [0, 1]')
     if config.diversity_regularizer_weight < 0.0:
         raise ValueError('diversity_regularizer_weight must be non-negative')
+    config.diverse_minibatch_oversample_factor = validate_diverse_minibatch_config(
+        enabled=config.diverse_minibatch,
+        oversample_factor=config.diverse_minibatch_oversample_factor,
+    )
+    config.entropy_regularization_weight = float(
+        config.entropy_regularization_weight
+    )
+    if config.entropy_regularization_weight < 0.0:
+        raise ValueError('entropy_regularization_weight must be non-negative')
     config.rollout_reward_weights = normalize_molecular_reward_weights(
         {
             'qed': config.qed,
@@ -205,6 +223,34 @@ def load_config(path):
             raise ValueError('group_rewrad_credit_temperature is only supported when rl_algorithm=coupled_sgrpo')
     if config.hbd and config.rl_algorithm != 'coupled_grpo':
         raise ValueError('hbd is only supported when rl_algorithm=coupled_grpo')
+    if config.diverse_minibatch:
+        if config.rl_algorithm != 'coupled_grpo':
+            raise ValueError(
+                'diverse_minibatch is only supported when rl_algorithm=coupled_grpo'
+            )
+        if config.hbd:
+            raise ValueError('diverse_minibatch and hbd cannot be enabled together')
+        if config.diversity_regularizer_weight != 0.0:
+            raise ValueError(
+                'diverse_minibatch and diversity_regularizer_weight cannot be enabled together'
+            )
+        if config.entropy_regularization_weight != 0.0:
+            raise ValueError(
+                'diverse_minibatch and entropy_regularization_weight cannot be enabled together'
+            )
+    if config.entropy_regularization_weight > 0.0:
+        if config.rl_algorithm != 'coupled_grpo':
+            raise ValueError(
+                'entropy regularization is only supported when rl_algorithm=coupled_grpo'
+            )
+        if config.hbd:
+            raise ValueError(
+                'entropy regularization and hbd cannot be enabled together'
+            )
+        if config.diversity_regularizer_weight != 0.0:
+            raise ValueError(
+                'entropy regularization and diversity_regularizer_weight cannot be enabled together'
+            )
     return config
 
 
@@ -391,12 +437,37 @@ class GenMolCpGRPOTrainer:
         self.world_size = self.accelerator.num_processes
         self.local_sample_count = config.per_device_train_batch_size * config.gradient_accumulation_steps
         self.global_sample_count = self.local_sample_count * self.world_size
-        if self.global_sample_count % config.num_generations != 0:
+        self.optimization_group_size = optimization_group_size(
+            config.num_generations,
+            enabled=config.diverse_minibatch,
+            oversample_factor=config.diverse_minibatch_oversample_factor,
+        )
+        self.candidate_group_size = int(config.num_generations)
+        if self.global_sample_count % self.optimization_group_size != 0:
             raise ValueError(
-                'global train batch size must be divisible by num_generations: '
-                f'{self.global_sample_count} vs {config.num_generations}'
+                'global train batch size must be divisible by the optimization '
+                f'group size: {self.global_sample_count} vs {self.optimization_group_size}'
             )
-        self.num_groups_global = self.global_sample_count // config.num_generations
+        self.num_groups_global = (
+            self.global_sample_count // self.optimization_group_size
+        )
+        self.local_candidate_count = self.local_sample_count
+        self.global_candidate_count = self.global_sample_count
+        if config.diverse_minibatch:
+            if self.local_sample_count % self.optimization_group_size != 0:
+                raise ValueError(
+                    'diverse_minibatch requires each rank batch to contain whole '
+                    f'groups: {self.local_sample_count} vs {self.optimization_group_size}'
+                )
+            local_group_count = (
+                self.local_sample_count // self.optimization_group_size
+            )
+            self.local_candidate_count = (
+                local_group_count * self.candidate_group_size
+            )
+            self.global_candidate_count = (
+                self.num_groups_global * self.candidate_group_size
+            )
         if config.rl_algorithm == 'coupled_sgrpo':
             if config.supergroup_num_groups <= 1:
                 raise ValueError('supergroup_num_groups must be greater than 1 for coupled_sgrpo')
@@ -582,6 +653,9 @@ class GenMolCpGRPOTrainer:
         ):
             if name in metadata:
                 bucket[name].append(float(metadata[name]))
+        for name, value in metadata.items():
+            if name.startswith('diverse_minibatch/'):
+                bucket[name].append(float(value))
 
     def _record_loss_metrics(self, mode, step_metrics):
         if mode not in self._metrics:
@@ -610,6 +684,17 @@ class GenMolCpGRPOTrainer:
                 step_metrics['diversity_regularizer_loss'].detach().reshape(1)
             )
             bucket['diversity_regularizer/loss'].append(torch.nanmean(gathered_diversity_loss).item())
+        for name in (
+            'entropy/normalized_mean',
+            'entropy/regularization_loss',
+        ):
+            if name in step_metrics:
+                gathered_entropy_metric = self.accelerator.gather_for_metrics(
+                    step_metrics[name].detach().reshape(1)
+                )
+                bucket[name].append(
+                    torch.nanmean(gathered_entropy_metric).item()
+                )
 
     def _record_optimizer_metrics(self, mode, grad_norm, lr):
         if mode not in self._metrics:
@@ -696,6 +781,91 @@ class GenMolCpGRPOTrainer:
         )
         return adjusted_rewards, hbd_update_payload['metrics']
 
+    def _select_diverse_rollout(self, rollout, local_specs, *, seed):
+        if not self.config.diverse_minibatch:
+            active_mask = torch.ones(
+                len(local_specs),
+                device=self.device,
+                dtype=torch.bool,
+            )
+            return rollout, local_specs, active_mask, {}
+
+        selection = select_molecule_groups(
+            rollout.smiles,
+            candidate_size=self.candidate_group_size,
+            selected_size=self.optimization_group_size,
+            seed=seed,
+        )
+        index_tensor = torch.tensor(
+            selection.indices,
+            device=self.device,
+            dtype=torch.long,
+        )
+        active_mask = torch.tensor(
+            selection.active_mask,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        if index_tensor.numel() != self.local_sample_count:
+            raise RuntimeError(
+                'Diverse Mini-Batch selection returned the wrong fixed batch size: '
+                f'{index_tensor.numel()} vs {self.local_sample_count}'
+            )
+        selected_rollout = replace(
+            rollout,
+            prompt_ids=rollout.prompt_ids.index_select(0, index_tensor),
+            completion_ids=rollout.completion_ids.index_select(0, index_tensor),
+            completion_mask=(
+                rollout.completion_mask.index_select(0, index_tensor)
+                & active_mask.unsqueeze(1)
+            ),
+            full_token_ids=rollout.full_token_ids.index_select(0, index_tensor),
+            specs=[rollout.specs[idx] for idx in selection.indices],
+            safe_strings=[rollout.safe_strings[idx] for idx in selection.indices],
+            smiles=[rollout.smiles[idx] for idx in selection.indices],
+        )
+        selected_specs = [local_specs[idx] for idx in selection.indices]
+        metrics = {
+            f'diverse_minibatch/{key}': float(value)
+            for key, value in selection.metrics.items()
+        }
+        metrics['diverse_minibatch/enabled'] = 1.0
+        return selected_rollout, selected_specs, active_mask, metrics
+
+    def _score_selected_rollout(self, rollout, active_mask):
+        if active_mask.dim() != 1 or active_mask.numel() != len(rollout.smiles):
+            raise ValueError('active_mask must match the selected rollout batch')
+        active_positions = torch.nonzero(
+            active_mask,
+            as_tuple=False,
+        ).view(-1).tolist()
+        if not active_positions:
+            raise RuntimeError('selected rollout contains no active samples')
+        active_records = self.reward_model.score(
+            [rollout.smiles[idx] for idx in active_positions]
+        )
+        if len(active_records) != len(active_positions):
+            raise RuntimeError(
+                'reward scorer returned an unexpected record count: '
+                f'{len(active_records)} vs {len(active_positions)}'
+            )
+        records = [
+            RewardRecord(
+                reward=0.0,
+                is_valid=False,
+                alert_hit=False,
+                qed=None,
+                sa=None,
+                sa_score=None,
+                soft_reward=None,
+                smiles=rollout.smiles[idx],
+            )
+            for idx in range(len(rollout.smiles))
+        ]
+        for position, record in zip(active_positions, active_records):
+            records[position] = record
+        return records
+
     def _generate_and_score_completions(self, mode):
         cycle_seed = self.config.seed + self.generation_cycle_idx * 10000
         if self.accelerator.is_main_process:
@@ -721,20 +891,44 @@ class GenMolCpGRPOTrainer:
         else:
             group_specs = []
 
-        expanded_specs = broadcast_specs(group_specs, self.config.num_generations, self.accelerator)
-        local_start = self.accelerator.process_index * self.local_sample_count
-        local_end = (self.accelerator.process_index + 1) * self.local_sample_count
-        local_specs = expanded_specs[local_start:local_end]
+        expanded_specs = broadcast_specs(
+            group_specs,
+            self.candidate_group_size,
+            self.accelerator,
+        )
+        if len(expanded_specs) != self.global_candidate_count:
+            raise ValueError(
+                f'Expected {self.global_candidate_count} candidate specs, '
+                f'got {len(expanded_specs)}'
+            )
+        candidate_local_start = (
+            self.accelerator.process_index * self.local_candidate_count
+        )
+        candidate_local_end = candidate_local_start + self.local_candidate_count
+        local_specs = expanded_specs[candidate_local_start:candidate_local_end]
         rollout_seed = cycle_seed + self.accelerator.process_index * 1000
         rollout = self.policy.rollout_specs(
             specs=local_specs,
             generation_batch_size=self.config.generation_batch_size,
             seed=rollout_seed,
         )
+        rollout, local_specs, local_active_mask, selection_metrics = (
+            self._select_diverse_rollout(
+                rollout,
+                local_specs,
+                seed=cycle_seed + self.accelerator.process_index * 100000 + 991,
+            )
+        )
 
-        reward_records = self.reward_model.score(rollout.smiles)
+        reward_records = self._score_selected_rollout(
+            rollout,
+            local_active_mask,
+        )
         local_rewards = torch.tensor([record.reward for record in reward_records], device=self.device, dtype=torch.float32)
         global_rewards = self.accelerator.gather(local_rewards).detach()
+        global_active_mask = self.accelerator.gather(local_active_mask).detach()
+        local_start = self.accelerator.process_index * self.local_sample_count
+        local_end = local_start + self.local_sample_count
         hbd_metrics = {}
         global_group_rewards = None
         global_group_reward_credits = None
@@ -804,8 +998,13 @@ class GenMolCpGRPOTrainer:
         if self.config.rl_algorithm == 'coupled_grpo':
             global_advantages, global_reward_std, zero_std_ratio = compute_grouped_advantages(
                 rewards=global_rewards,
-                num_generations=self.config.num_generations,
+                num_generations=self.optimization_group_size,
                 scale_rewards=self.config.scale_rewards,
+                sample_mask=(
+                    global_active_mask
+                    if self.config.diverse_minibatch
+                    else None
+                ),
             )
             local_advantages = global_advantages[local_start:local_end].to(device=self.device)
             extra_advantage_metrics = {}
@@ -864,6 +1063,7 @@ class GenMolCpGRPOTrainer:
                 }
             )
         extra_advantage_metrics.update({f'hbd/{key}': float(value) for key, value in hbd_metrics.items()})
+        extra_advantage_metrics.update(selection_metrics)
         local_final_rewards = global_rewards[local_start:local_end].to(device=self.device)
 
         local_valid = torch.tensor([float(record.is_valid) for record in reward_records], device=self.device)
@@ -924,12 +1124,15 @@ class GenMolCpGRPOTrainer:
             )
 
         log_rows = []
-        for spec, safe_string, record, final_reward in zip(
+        for spec, safe_string, record, final_reward, is_active in zip(
             local_specs,
             rollout.safe_strings,
             reward_records,
             local_final_rewards.tolist(),
+            local_active_mask.tolist(),
         ):
+            if not is_active:
+                continue
             log_rows.append(
                 {
                     'mode': mode,
@@ -948,16 +1151,22 @@ class GenMolCpGRPOTrainer:
                 }
             )
 
+        active_global_rewards = global_rewards[global_active_mask]
+        active_global_reward_std = global_reward_std[global_active_mask]
+        active_gathered_advantages = gathered_advantages[global_active_mask]
+        active_gathered_lengths = gathered_lengths[global_active_mask]
+        active_gathered_valid = gathered_valid[global_active_mask]
+        active_gathered_alert = gathered_alert[global_active_mask]
         metadata = {
             'buffer_cycle': self.generation_cycle_idx,
-            'reward_mean': global_rewards.mean().item(),
-            'reward_std': global_reward_std.mean().item(),
-            'advantage_mean': gathered_advantages.mean().item(),
+            'reward_mean': active_global_rewards.mean().item(),
+            'reward_std': active_global_reward_std.mean().item(),
+            'advantage_mean': active_gathered_advantages.mean().item(),
             'zero_std_ratio': zero_std_ratio,
-            'completion_length': gathered_lengths.mean().item(),
-            'valid_fraction': gathered_valid.mean().item(),
-            'alert_hit_fraction': gathered_alert.mean().item(),
-            'invalid_fraction': 1.0 - gathered_valid.mean().item(),
+            'completion_length': active_gathered_lengths.mean().item(),
+            'valid_fraction': active_gathered_valid.mean().item(),
+            'alert_hit_fraction': active_gathered_alert.mean().item(),
+            'invalid_fraction': 1.0 - active_gathered_valid.mean().item(),
             'rewards/qed_mean': _nanmean(gathered_qed),
             'rewards/sa_mean': _nanmean(gathered_sa),
             'rewards/sa_score_mean': _nanmean(gathered_sa_score),
@@ -996,14 +1205,22 @@ class GenMolCpGRPOTrainer:
         prompt_completion_ids = torch.cat([inputs['prompt_ids'], inputs['completion_ids']], dim=1).unsqueeze(0)
         logits_to_keep = inputs['completion_ids'].size(1)
         current_seed = [inputs['mask_seeds'][iteration_idx]]
-        per_token_logps = self.policy.per_token_logps(
+        policy_outputs = self.policy.per_token_logps(
             input_ids=prompt_completion_ids,
             logits_to_keep=logits_to_keep,
             completion_mask=inputs['completion_mask'],
             mask_seeds=current_seed,
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             requires_grad=requires_grad,
+            return_normalized_entropy=(
+                self.config.entropy_regularization_weight > 0.0
+            ),
         )
+        if self.config.entropy_regularization_weight > 0.0:
+            per_token_logps, per_token_normalized_entropy = policy_outputs
+        else:
+            per_token_logps = policy_outputs
+            per_token_normalized_entropy = None
         if inputs['old_per_token_logps'] is None:
             old_per_token_logps = per_token_logps.detach()
         else:
@@ -1023,6 +1240,26 @@ class GenMolCpGRPOTrainer:
             ref_log_probs=ref_per_token_logps,
             beta=self.config.beta,
         )
+        if self.config.entropy_regularization_weight > 0.0:
+            if per_token_normalized_entropy is None:
+                raise RuntimeError(
+                    'policy did not return entropy while entropy regularization is enabled'
+                )
+            entropy_mask = inputs['completion_mask'].to(dtype=torch.float32)
+            normalized_entropy_mean = (
+                per_token_normalized_entropy[:, 0, :] * entropy_mask
+            ).sum() / entropy_mask.sum().clamp(min=1.0)
+            entropy_regularization_loss = -normalized_entropy_mean
+            loss = loss + (
+                self.config.entropy_regularization_weight
+                * entropy_regularization_loss
+            )
+            step_metrics['entropy/normalized_mean'] = (
+                normalized_entropy_mean.detach()
+            )
+            step_metrics['entropy/regularization_loss'] = (
+                entropy_regularization_loss.detach()
+            )
         if self.config.diversity_regularizer_weight > 0.0:
             diversity_regularizer_advantages = inputs['diversity_regularizer_advantages']
             if diversity_regularizer_advantages is None:
@@ -1112,12 +1349,21 @@ class GenMolCpGRPOTrainer:
         ):
             if bucket[name] or name in last_reward_metrics:
                 metrics[name] = _reward_metric(name)
+        for name, values in bucket.items():
+            if name.startswith('diverse_minibatch/') and values:
+                metrics[name] = _aggregate_scalar_list(values)
         metrics['reward_mean'] = metrics['reward']
         if bucket['kl']:
             metrics['kl'] = _aggregate_scalar_list(bucket['kl'])
             metrics['kl_mean'] = metrics['kl']
         if bucket['diversity_regularizer/loss']:
             metrics['diversity_regularizer/loss'] = _aggregate_scalar_list(bucket['diversity_regularizer/loss'])
+        for name in (
+            'entropy/normalized_mean',
+            'entropy/regularization_loss',
+        ):
+            if bucket[name]:
+                metrics[name] = _aggregate_scalar_list(bucket[name])
         self._metrics[mode] = defaultdict(list)
         return metrics
 

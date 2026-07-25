@@ -1,0 +1,116 @@
+import unittest
+
+import torch
+
+from genmol.rl.cpgrpo import selective_log_softmax
+from rl_shared.diverse_minibatch import (
+    optimization_group_size,
+    select_molecule_groups,
+    select_sequence_groups,
+)
+from rl_shared.sgrpo import compute_grouped_advantages
+
+
+class DiverseMiniBatchTest(unittest.TestCase):
+    def test_candidate_count_maps_to_original_optimization_group_size(self):
+        self.assertEqual(
+            optimization_group_size(
+                1024,
+                enabled=True,
+                oversample_factor=2,
+            ),
+            512,
+        )
+        self.assertEqual(
+            optimization_group_size(
+                512,
+                enabled=False,
+                oversample_factor=2,
+            ),
+            512,
+        )
+
+    def test_molecule_shortfall_uses_all_valid_candidates_and_masks_padding(self):
+        selection = select_molecule_groups(
+            ['CCO', None, 'not-a-smiles', 'CCN'],
+            candidate_size=4,
+            selected_size=3,
+            seed=7,
+        )
+        self.assertEqual(sum(selection.active_mask), 2)
+        self.assertEqual(len(selection.indices), 3)
+        active_smiles = [
+            ['CCO', None, 'not-a-smiles', 'CCN'][idx]
+            for idx, active in zip(selection.indices, selection.active_mask)
+            if active
+        ]
+        self.assertEqual(sorted(active_smiles), ['CCN', 'CCO'])
+        self.assertEqual(selection.metrics['shortfall_count'], 1.0)
+
+    def test_exact_tanimoto_k_dpp_returns_unique_valid_subset(self):
+        smiles = [
+            'CCO',
+            'CCN',
+            'CCC',
+            'c1ccccc1',
+            'CC(=O)O',
+            'C1CCCCC1',
+        ]
+        selection = select_molecule_groups(
+            smiles,
+            candidate_size=6,
+            selected_size=3,
+            seed=11,
+        )
+        self.assertEqual(sum(selection.active_mask), 3)
+        self.assertEqual(len(set(selection.indices)), 3)
+        self.assertEqual(selection.metrics['exact_dpp_group_count'], 1.0)
+
+    def test_sequence_maxmin_shortfall_masks_padding(self):
+        selection = select_sequence_groups(
+            ['ACDE', '', 'AX', 'WYYY'],
+            candidate_size=4,
+            selected_size=3,
+            seed=5,
+        )
+        self.assertEqual(sum(selection.active_mask), 2)
+        self.assertEqual(len(selection.indices), 3)
+        self.assertEqual(selection.metrics['shortfall_count'], 1.0)
+
+    def test_masked_grouped_advantages_ignore_padding(self):
+        rewards = torch.tensor([1.0, 2.0, 100.0, 4.0])
+        mask = torch.tensor([True, True, False, True])
+        advantages, repeated_std, zero_std_ratio = compute_grouped_advantages(
+            rewards,
+            num_generations=2,
+            sample_mask=mask,
+        )
+        self.assertTrue(
+            torch.allclose(
+                advantages,
+                torch.tensor([-1.0, 1.0, 0.0, 0.0]),
+            )
+        )
+        self.assertEqual(repeated_std[2].item(), 0.0)
+        self.assertAlmostEqual(zero_std_ratio, 1.0 / 3.0)
+
+    def test_coupled_entropy_uses_same_states_without_an_extra_forward(self):
+        logits = torch.zeros(3, 2, 4, requires_grad=True)
+        targets = torch.tensor([[0, 1]])
+        partial_mask = torch.tensor([[True, False]])
+        logps, entropy = selective_log_softmax(
+            logits,
+            targets,
+            weights=torch.tensor([1.0, 2.0, 3.0]),
+            mask=partial_mask,
+            return_normalized_entropy=True,
+        )
+        self.assertEqual(tuple(logps.shape), (1, 2))
+        self.assertEqual(tuple(entropy.shape), (1, 2))
+        self.assertTrue(torch.all(entropy > 0.0))
+        entropy.mean().backward()
+        self.assertIsNotNone(logits.grad)
+
+
+if __name__ == '__main__':
+    unittest.main()

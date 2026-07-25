@@ -6,7 +6,7 @@ import random
 import re
 import shutil
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
 import torch
@@ -46,6 +46,11 @@ from rl_shared.sgrpo import (
     validate_reward_threshold_names,
 )
 from rl_shared.hbd import build_sequence_hbd_memory, validate_hbd_config
+from rl_shared.diverse_minibatch import (
+    optimization_group_size,
+    select_sequence_groups,
+    validate_diverse_minibatch_config,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +114,9 @@ class ProGen2TrainConfig:
     hbd_bucket_size: int = 25
     hbd_score_threshold_for_memory: float = 0.6
     hbd_similarity_cutoff: float = 0.6
+    diverse_minibatch: bool = False
+    diverse_minibatch_oversample_factor: int = 2
+    entropy_regularization_weight: float = 0.0
 
 
 def load_config(path):
@@ -127,6 +135,7 @@ def load_config(path):
         'max_new_tokens',
         'reward_calibration_size',
         'reward_calibration_prompt_batch_size',
+        'diverse_minibatch_oversample_factor',
     ]
     float_fields = [
         'learning_rate',
@@ -139,6 +148,7 @@ def load_config(path):
         'epsilon',
         'group_advantage_weight',
         'top_p',
+        'entropy_regularization_weight',
     ]
     for field_name in int_fields:
         if field_name in raw and raw[field_name] is not None:
@@ -168,6 +178,15 @@ def load_config(path):
         raise ValueError('max_steps must be positive')
     if config.num_generations <= 1:
         raise ValueError('num_generations must be greater than 1')
+    config.diverse_minibatch_oversample_factor = validate_diverse_minibatch_config(
+        enabled=config.diverse_minibatch,
+        oversample_factor=config.diverse_minibatch_oversample_factor,
+    )
+    config.entropy_regularization_weight = float(
+        config.entropy_regularization_weight
+    )
+    if config.entropy_regularization_weight < 0.0:
+        raise ValueError('entropy_regularization_weight must be non-negative')
     if config.rl_algorithm not in {'grpo', 'sgrpo'}:
         raise ValueError("rl_algorithm must be 'grpo' or 'sgrpo'")
     if config.supergroup_num_groups <= 0:
@@ -240,6 +259,26 @@ def load_config(path):
     )
     if config.hbd and config.rl_algorithm != 'grpo':
         raise ValueError('hbd is only supported when rl_algorithm=grpo')
+    if config.diverse_minibatch:
+        if config.rl_algorithm != 'grpo':
+            raise ValueError(
+                'diverse_minibatch is only supported when rl_algorithm=grpo'
+            )
+        if config.hbd:
+            raise ValueError('diverse_minibatch and hbd cannot be enabled together')
+        if config.entropy_regularization_weight != 0.0:
+            raise ValueError(
+                'diverse_minibatch and entropy_regularization_weight cannot be enabled together'
+            )
+    if config.entropy_regularization_weight > 0.0:
+        if config.rl_algorithm != 'grpo':
+            raise ValueError(
+                'entropy regularization is only supported when rl_algorithm=grpo'
+            )
+        if config.hbd:
+            raise ValueError(
+                'entropy regularization and hbd cannot be enabled together'
+            )
     return config
 
 
@@ -348,10 +387,15 @@ def _write_jsonl(path, payload):
         handle.write(json.dumps(payload, sort_keys=True) + '\n')
 
 
-def default_reward_batch_size(config):
+def default_reward_batch_size(config, *, num_generations=None):
+    group_size = (
+        config.num_generations
+        if num_generations is None
+        else int(num_generations)
+    )
     return int(
         config.per_device_prompt_batch_size
-        * config.num_generations
+        * group_size
         * config.supergroup_num_groups
     )
 
@@ -434,11 +478,19 @@ class ProGen2SGRPOTrainer:
 
         self.prompts = load_prompt_texts(config.prompt_path)
         self._prompt_cursor = self.accelerator.process_index * config.per_device_prompt_batch_size
-        self.num_return_sequences = (
-            config.num_generations * config.supergroup_num_groups
-            if config.rl_algorithm == 'sgrpo'
-            else config.num_generations
+        self.optimization_group_size = optimization_group_size(
+            config.num_generations,
+            enabled=config.diverse_minibatch,
+            oversample_factor=config.diverse_minibatch_oversample_factor,
         )
+        self.num_return_sequences = (
+            self.optimization_group_size * config.supergroup_num_groups
+            if config.rl_algorithm == 'sgrpo'
+            else self.optimization_group_size
+        )
+        self.candidate_num_return_sequences = self.num_return_sequences
+        if config.diverse_minibatch:
+            self.candidate_num_return_sequences = int(config.num_generations)
 
         self.policy = ProGen2Policy(
             OfficialProGen2CausalLM(
@@ -480,7 +532,10 @@ class ProGen2SGRPOTrainer:
         self.reward_model = CompositeProteinReward(
             config.rewards,
             device=self.device,
-            default_reward_batch_size=default_reward_batch_size(config),
+            default_reward_batch_size=default_reward_batch_size(
+                config,
+                num_generations=self.optimization_group_size,
+            ),
             reward_compute_every_n_steps=config.reward_compute_every_n_steps,
             reward_weights=config.rollout_reward_weights,
         )
@@ -560,6 +615,67 @@ class ProGen2SGRPOTrainer:
             batches,
             pad_token_id=self.policy.model.tokenizer.pad_token_id,
         )
+
+    def _select_diverse_rollout(self, rollout, *, seed):
+        if not self.config.diverse_minibatch:
+            active_mask = torch.ones(
+                len(rollout.protein_sequences),
+                device=self.device,
+                dtype=torch.bool,
+            )
+            return rollout, active_mask, {}
+
+        selection = select_sequence_groups(
+            rollout.protein_sequences,
+            candidate_size=self.candidate_num_return_sequences,
+            selected_size=self.optimization_group_size,
+            seed=seed,
+        )
+        index_tensor = torch.tensor(
+            selection.indices,
+            device=self.device,
+            dtype=torch.long,
+        )
+        active_mask = torch.tensor(
+            selection.active_mask,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        expected_size = (
+            self.config.per_device_prompt_batch_size
+            * self.optimization_group_size
+        )
+        if index_tensor.numel() != expected_size:
+            raise RuntimeError(
+                'Diverse Mini-Batch selection returned the wrong fixed batch size: '
+                f'{index_tensor.numel()} vs {expected_size}'
+            )
+        selected_rollout = replace(
+            rollout,
+            prompt_texts=[rollout.prompt_texts[idx] for idx in selection.indices],
+            prompt_lengths=rollout.prompt_lengths.index_select(0, index_tensor),
+            full_token_ids=rollout.full_token_ids.index_select(0, index_tensor),
+            full_attention_mask=rollout.full_attention_mask.index_select(
+                0,
+                index_tensor,
+            ),
+            generated_mask=(
+                rollout.generated_mask.index_select(0, index_tensor)
+                & active_mask.unsqueeze(1)
+            ),
+            decoded_texts=[
+                rollout.decoded_texts[idx] for idx in selection.indices
+            ],
+            protein_sequences=[
+                rollout.protein_sequences[idx] for idx in selection.indices
+            ],
+        )
+        metrics = {
+            f'diverse_minibatch/{key}': float(value)
+            for key, value in selection.metrics.items()
+        }
+        metrics['diverse_minibatch/enabled'] = 1.0
+        return selected_rollout, active_mask, metrics
 
     def _all_gather_object(self, payload):
         if self.accelerator.num_processes == 1:
@@ -701,16 +817,37 @@ class ProGen2SGRPOTrainer:
             os.fsync(handle.fileno())
         os.replace(calibration_tmp_path, path)
 
-    def _score_rollout_rewards(self, sequences, *, step_number):
+    def _score_rollout_rewards(
+        self,
+        sequences,
+        *,
+        step_number,
+        active_mask=None,
+    ):
+        if active_mask is None:
+            active_flags = [True] * len(sequences)
+        else:
+            if not torch.is_tensor(active_mask):
+                raise ValueError('active_mask must be a tensor when provided')
+            if active_mask.dim() != 1 or active_mask.numel() != len(sequences):
+                raise ValueError('active_mask must match the sequence batch')
+            active_flags = active_mask.to(dtype=torch.bool).tolist()
+        active_count = sum(active_flags)
+        if active_count == 0:
+            raise RuntimeError('reward scoring requires at least one active sequence')
         valid_indices = [
             idx for idx, sequence in enumerate(sequences)
-            if is_valid_protein_sequence(sequence)
+            if active_flags[idx] and is_valid_protein_sequence(sequence)
         ]
         rewards = [0.0] * len(sequences)
         individual_reward_values = {
             reward_name: [0.0] * len(sequences) for reward_name in REWARD_NAME_ORDER
         }
-        metrics = {'invalid_sequence_rate': 1.0 if not valid_indices else 1.0 - (len(valid_indices) / len(sequences))}
+        metrics = {
+            'invalid_sequence_rate': 1.0 - (
+                len(valid_indices) / active_count
+            )
+        }
         if valid_indices:
             valid_sequences = [sequences[idx] for idx in valid_indices]
             reward_details, reward_metrics = self.reward_model.score_details(
@@ -734,17 +871,31 @@ class ProGen2SGRPOTrainer:
             individual_reward_tensors,
         )
 
-    def _score_group_rewards(self, sequences):
+    def _score_group_rewards(self, sequences, active_mask=None):
+        if active_mask is None:
+            active_flags = [True] * len(sequences)
+        else:
+            if active_mask.dim() != 1 or active_mask.numel() != len(sequences):
+                raise ValueError('active_mask must match the sequence batch')
+            active_flags = active_mask.to(dtype=torch.bool).tolist()
         group_rewards = []
-        for start in range(0, len(sequences), self.config.num_generations):
-            group_sequences = sequences[start:start + self.config.num_generations]
+        for start in range(0, len(sequences), self.optimization_group_size):
+            end = start + self.optimization_group_size
+            group_sequences = [
+                sequence
+                for sequence, active in zip(
+                    sequences[start:end],
+                    active_flags[start:end],
+                )
+                if active
+            ]
             group_rewards.append(float(compute_group_diversity_reward_or_zero(group_sequences)))
         return torch.tensor(group_rewards, device=self.device, dtype=torch.float32)
 
     def _score_group_reward_credits(self, sequences):
         group_credits = []
-        for start in range(0, len(sequences), self.config.num_generations):
-            group_sequences = sequences[start:start + self.config.num_generations]
+        for start in range(0, len(sequences), self.optimization_group_size):
+            group_sequences = sequences[start:start + self.optimization_group_size]
             group_credits.extend(compute_group_diversity_loo_credits(group_sequences))
         return torch.tensor(group_credits, device=self.device, dtype=torch.float32)
 
@@ -795,12 +946,15 @@ class ProGen2SGRPOTrainer:
         for reward_name, reward_values in individual_reward_tensors.items():
             if reward_values.dim() != 1:
                 raise ValueError(f'individual reward tensor for {reward_name!r} must be 1D')
-            if reward_values.numel() % self.config.num_generations != 0:
+            if reward_values.numel() % self.optimization_group_size != 0:
                 raise ValueError(
                     'individual reward tensor length must be divisible by num_generations: '
-                    f'{reward_name!r} has {reward_values.numel()} vs {self.config.num_generations}'
+                    f'{reward_name!r} has {reward_values.numel()} vs {self.optimization_group_size}'
                 )
-            outputs[reward_name] = reward_values.view(-1, self.config.num_generations).mean(dim=1)
+            outputs[reward_name] = reward_values.view(
+                -1,
+                self.optimization_group_size,
+            ).mean(dim=1)
         return outputs
 
     def _compute_advantages(
@@ -809,6 +963,7 @@ class ProGen2SGRPOTrainer:
         group_rewards,
         group_mean_individual_rewards=None,
         group_reward_credits=None,
+        sample_mask=None,
     ):
         advantages = []
         expanded_group_advantages = []
@@ -824,6 +979,13 @@ class ProGen2SGRPOTrainer:
             start = prompt_idx * chunk_rollout
             end = start + chunk_rollout
             prompt_rollout_rewards = rollout_rewards[start:end]
+            prompt_sample_mask = None
+            if sample_mask is not None:
+                if sample_mask.dim() != 1 or sample_mask.shape != rollout_rewards.shape:
+                    raise ValueError(
+                        'sample_mask must be 1D and match rollout_rewards'
+                    )
+                prompt_sample_mask = sample_mask[start:end]
             group_start = prompt_idx * chunk_groups
             group_end = group_start + chunk_groups
             prompt_group_rewards = group_rewards[group_start:group_end]
@@ -840,7 +1002,7 @@ class ProGen2SGRPOTrainer:
                 prompt_adv, prompt_group_adv, prompt_rollout_adv, prompt_metrics = compute_sgrpo_advantages(
                     rollout_rewards=prompt_rollout_rewards,
                     group_rewards=prompt_group_rewards,
-                    num_generations=self.config.num_generations,
+                    num_generations=self.optimization_group_size,
                     supergroup_num_groups=self.config.supergroup_num_groups,
                     group_advantage_weight=self.config.group_advantage_weight,
                     scale_rewards=False,
@@ -854,8 +1016,9 @@ class ProGen2SGRPOTrainer:
             else:
                 prompt_adv, _, zero_std_ratio = compute_grouped_advantages(
                     rewards=prompt_rollout_rewards,
-                    num_generations=self.config.num_generations,
+                    num_generations=self.optimization_group_size,
                     scale_rewards=False,
+                    sample_mask=prompt_sample_mask,
                 )
                 prompt_rollout_adv = prompt_adv
                 prompt_group_adv = torch.zeros_like(prompt_rollout_rewards)
@@ -1018,8 +1181,19 @@ class ProGen2SGRPOTrainer:
             prompts = self._next_prompt_batch()
             rollout = self._generate_rollouts(
                 prompts,
-                num_return_sequences=self.num_return_sequences,
+                num_return_sequences=self.candidate_num_return_sequences,
                 seed=self.config.seed + self.global_step,
+            )
+            rollout, active_mask, selection_metrics = (
+                self._select_diverse_rollout(
+                    rollout,
+                    seed=(
+                        self.config.seed
+                        + self.global_step * 10000
+                        + self.accelerator.process_index * 1000
+                        + 991
+                    ),
+                )
             )
             if self.device.type == 'cuda':
                 rollout_phase_metrics, rollout_step_peak_reserved, rollout_step_peak_allocated = (
@@ -1031,6 +1205,7 @@ class ProGen2SGRPOTrainer:
             rollout_rewards, reward_metrics, individual_reward_tensors = self._score_rollout_rewards(
                 rollout.protein_sequences,
                 step_number=self.global_step + 1,
+                active_mask=active_mask,
             )
             hbd_metrics = {}
             if self._hbd_memory is not None:
@@ -1038,7 +1213,10 @@ class ProGen2SGRPOTrainer:
                     rollout.protein_sequences,
                     rollout_rewards,
                 )
-            group_rewards = self._score_group_rewards(rollout.protein_sequences)
+            group_rewards = self._score_group_rewards(
+                rollout.protein_sequences,
+                active_mask=active_mask,
+            )
             group_reward_credits = None
             if self.config.rl_algorithm == 'sgrpo' and self.config.group_rewrad_credit == 'loo':
                 group_reward_credits = self._score_group_reward_credits(rollout.protein_sequences)
@@ -1050,6 +1228,11 @@ class ProGen2SGRPOTrainer:
                 group_rewards,
                 group_mean_individual_rewards=group_mean_individual_rewards,
                 group_reward_credits=group_reward_credits,
+                sample_mask=(
+                    active_mask
+                    if self.config.diverse_minibatch
+                    else None
+                ),
             )
             if self.device.type == 'cuda':
                 reward_phase_metrics, reward_step_peak_reserved, reward_step_peak_allocated = (
@@ -1072,12 +1255,24 @@ class ProGen2SGRPOTrainer:
                     requires_grad=False,
                 )
 
-            new_log_probs, completion_mask = self.policy.per_token_logps(
+            policy_outputs = self.policy.per_token_logps(
                 rollout.full_token_ids,
                 rollout.full_attention_mask,
                 rollout.generated_mask,
                 requires_grad=True,
+                return_normalized_entropy=(
+                    self.config.entropy_regularization_weight > 0.0
+                ),
             )
+            if self.config.entropy_regularization_weight > 0.0:
+                (
+                    new_log_probs,
+                    completion_mask,
+                    per_token_normalized_entropy,
+                ) = policy_outputs
+            else:
+                new_log_probs, completion_mask = policy_outputs
+                per_token_normalized_entropy = None
             loss, loss_metrics = compute_clipped_grpo_loss(
                 new_log_probs=new_log_probs,
                 old_log_probs=old_log_probs,
@@ -1087,6 +1282,26 @@ class ProGen2SGRPOTrainer:
                 ref_log_probs=ref_log_probs,
                 beta=self.config.beta,
             )
+            if self.config.entropy_regularization_weight > 0.0:
+                if per_token_normalized_entropy is None:
+                    raise RuntimeError(
+                        'policy did not return entropy while entropy regularization is enabled'
+                    )
+                entropy_mask = completion_mask.to(dtype=torch.float32)
+                normalized_entropy_mean = (
+                    per_token_normalized_entropy[:, 0, :] * entropy_mask
+                ).sum() / entropy_mask.sum().clamp(min=1.0)
+                entropy_regularization_loss = -normalized_entropy_mean
+                loss = loss + (
+                    self.config.entropy_regularization_weight
+                    * entropy_regularization_loss
+                )
+                loss_metrics['entropy/normalized_mean'] = (
+                    normalized_entropy_mean.detach()
+                )
+                loss_metrics['entropy/regularization_loss'] = (
+                    entropy_regularization_loss.detach()
+                )
 
             self.optimizer.zero_grad(set_to_none=True)
             self.accelerator.backward(loss)
@@ -1099,16 +1314,21 @@ class ProGen2SGRPOTrainer:
                 )
 
             self.global_step += 1
+            active_rollout_rewards = rollout_rewards[active_mask]
+            active_advantages = advantages[active_mask]
+            active_group_advantages = group_advantages[active_mask]
+            active_rollout_advantages = rollout_advantages[active_mask]
             metrics = {
                 'loss': float(loss.detach().item()),
-                'reward_mean': float(rollout_rewards.mean().item()),
+                'reward_mean': float(active_rollout_rewards.mean().item()),
                 'group_reward_mean': float(advantage_metrics.get('group_reward_mean', group_rewards.mean().item())),
                 'group_reward_raw_mean': float(advantage_metrics.get('group_reward_raw_mean', group_rewards.mean().item())),
                 'group_reward_indicator_mean': float(advantage_metrics.get('group_reward_indicator_mean', 1.0)),
-                'advantage_mean': float(advantages.mean().item()),
-                'group_advantage_mean': float(group_advantages.mean().item()),
-                'rollout_advantage_mean': float(rollout_advantages.mean().item()),
+                'advantage_mean': float(active_advantages.mean().item()),
+                'group_advantage_mean': float(active_group_advantages.mean().item()),
+                'rollout_advantage_mean': float(active_rollout_advantages.mean().item()),
                 **{key: float(value) for key, value in reward_metrics.items()},
+                **selection_metrics,
                 **{f'hbd/{key}': float(value) for key, value in hbd_metrics.items()},
                 **{key: float(value) for key, value in advantage_metrics.items()},
                 **{key: float(value.item() if hasattr(value, 'item') else value) for key, value in loss_metrics.items()},

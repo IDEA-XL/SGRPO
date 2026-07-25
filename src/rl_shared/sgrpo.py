@@ -66,21 +66,91 @@ def _compute_group_reward_indicator(group_mean_individual_rewards, group_reward_
     return indicator, active_threshold_count
 
 
-def compute_grouped_advantages(rewards, num_generations, scale_rewards=False):
+def compute_grouped_advantages(
+    rewards,
+    num_generations,
+    scale_rewards=False,
+    sample_mask=None,
+):
     if rewards.dim() != 1:
         raise ValueError('rewards must be a 1D tensor')
+    if num_generations <= 1:
+        raise ValueError('num_generations must be greater than 1')
     if rewards.numel() % num_generations != 0:
         raise ValueError('rewards length must be divisible by num_generations')
 
     rewards_grouped = rewards.view(-1, num_generations)
-    sum_group = rewards_grouped.sum(dim=1, keepdim=True)
-    baseline = (sum_group - rewards_grouped) / (num_generations - 1)
-    advantages = (rewards_grouped - baseline).view(-1)
-    std_grouped = rewards_grouped.std(dim=1, keepdim=True)
-    repeated_std = std_grouped.repeat_interleave(num_generations, dim=1).view(-1)
+    if sample_mask is None:
+        sum_group = rewards_grouped.sum(dim=1, keepdim=True)
+        baseline = (sum_group - rewards_grouped) / (num_generations - 1)
+        advantages = (rewards_grouped - baseline).view(-1)
+        std_grouped = rewards_grouped.std(dim=1, keepdim=True)
+        repeated_std = std_grouped.repeat_interleave(num_generations, dim=1).view(-1)
+        if scale_rewards:
+            advantages = advantages / (repeated_std + 1e-4)
+        zero_std_ratio = (repeated_std < 1e-6).to(torch.float32).mean().item()
+        return advantages, repeated_std, zero_std_ratio
+
+    if not torch.is_tensor(sample_mask):
+        raise ValueError('sample_mask must be a tensor when provided')
+    if sample_mask.dim() != 1 or sample_mask.shape != rewards.shape:
+        raise ValueError(
+            'sample_mask must be a 1D tensor matching rewards, '
+            f'got {tuple(sample_mask.shape)} vs {tuple(rewards.shape)}'
+        )
+    mask_grouped = sample_mask.to(device=rewards.device, dtype=torch.bool).view(
+        -1,
+        num_generations,
+    )
+    active_counts = mask_grouped.sum(dim=1, keepdim=True)
+    if torch.any(active_counts == 0):
+        empty_groups = torch.nonzero(active_counts.squeeze(1) == 0).view(-1).tolist()
+        raise ValueError(
+            f'every reward group must contain at least one active sample; empty groups={empty_groups}'
+        )
+
+    masked_rewards = torch.where(
+        mask_grouped,
+        rewards_grouped,
+        torch.zeros_like(rewards_grouped),
+    )
+    sum_group = masked_rewards.sum(dim=1, keepdim=True)
+    loo_denominator = (active_counts - 1).clamp(min=1).to(dtype=rewards.dtype)
+    baseline = (sum_group - rewards_grouped) / loo_denominator
+    grouped_advantages = torch.where(
+        mask_grouped & (active_counts > 1),
+        rewards_grouped - baseline,
+        torch.zeros_like(rewards_grouped),
+    )
+
+    active_counts_float = active_counts.to(dtype=rewards.dtype)
+    means = sum_group / active_counts_float
+    squared_deviations = torch.where(
+        mask_grouped,
+        (rewards_grouped - means).square(),
+        torch.zeros_like(rewards_grouped),
+    ).sum(dim=1, keepdim=True)
+    variances = torch.where(
+        active_counts > 1,
+        squared_deviations / (active_counts_float - 1).clamp(min=1.0),
+        torch.zeros_like(squared_deviations),
+    )
+    std_grouped = variances.sqrt()
+    repeated_std_grouped = torch.where(
+        mask_grouped,
+        std_grouped.expand_as(rewards_grouped),
+        torch.zeros_like(rewards_grouped),
+    )
+    advantages = grouped_advantages.view(-1)
+    repeated_std = repeated_std_grouped.view(-1)
     if scale_rewards:
-        advantages = advantages / (repeated_std + 1e-4)
-    zero_std_ratio = (repeated_std < 1e-6).to(torch.float32).mean().item()
+        advantages = torch.where(
+            sample_mask.to(device=rewards.device, dtype=torch.bool),
+            advantages / (repeated_std + 1e-4),
+            torch.zeros_like(advantages),
+        )
+    active_std = repeated_std[sample_mask.to(device=rewards.device, dtype=torch.bool)]
+    zero_std_ratio = (active_std < 1e-6).to(torch.float32).mean().item()
     return advantages, repeated_std, zero_std_ratio
 
 

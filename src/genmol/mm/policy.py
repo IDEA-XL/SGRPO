@@ -57,6 +57,7 @@ def get_per_token_logps_with_pocket(
     requires_grad,
     pocket_raw_embeddings,
     pocket_mask,
+    return_normalized_entropy=False,
 ):
     if input_ids.dim() != 3:
         raise ValueError(f'Expected input_ids to have 3 dimensions, got {input_ids.dim()}')
@@ -122,14 +123,33 @@ def get_per_token_logps_with_pocket(
         completion_logits = logits[:, -logits_to_keep:, :]
         completion_targets = expanded_input[:, -logits_to_keep:]
         completion_loss_mask = partial_mask[:, -logits_to_keep:]
-        per_token_logps = selective_log_softmax(
+        selective_outputs = selective_log_softmax(
             logits=completion_logits,
             index=completion_targets,
             weights=weights,
             mask=completion_loss_mask,
-        ).view(num_iterations, batch_size, logits_to_keep).permute(1, 0, 2)
+            return_normalized_entropy=return_normalized_entropy,
+        )
+        if return_normalized_entropy:
+            per_token_logps, normalized_entropy = selective_outputs
+            normalized_entropy = normalized_entropy.view(
+                num_iterations,
+                batch_size,
+                logits_to_keep,
+            ).permute(1, 0, 2)
+        else:
+            per_token_logps = selective_outputs
+            normalized_entropy = None
+        per_token_logps = per_token_logps.view(
+            num_iterations,
+            batch_size,
+            logits_to_keep,
+        ).permute(1, 0, 2)
 
-    return per_token_logps.to(torch.float32)
+    per_token_logps = per_token_logps.to(torch.float32)
+    if not return_normalized_entropy:
+        return per_token_logps
+    return per_token_logps, normalized_entropy.to(torch.float32)
 
 
 class PocketPrefixCpGRPOPolicy:
@@ -253,6 +273,7 @@ class PocketPrefixCpGRPOPolicy:
         requires_grad,
         pocket_raw_embeddings,
         pocket_mask,
+        return_normalized_entropy=False,
     ):
         def score_fn(batch, repeated_pocket_embeddings, repeated_pocket_mask):
             return self.forward_logits(batch, repeated_pocket_embeddings, repeated_pocket_mask)
@@ -268,6 +289,7 @@ class PocketPrefixCpGRPOPolicy:
             requires_grad=requires_grad,
             pocket_raw_embeddings=pocket_raw_embeddings,
             pocket_mask=pocket_mask,
+            return_normalized_entropy=return_normalized_entropy,
         )
 
     def _decode_safe_strings(self, token_ids):

@@ -1,5 +1,6 @@
 import os
 import random
+import math
 from dataclasses import dataclass
 
 import torch
@@ -104,7 +105,14 @@ class ProGen2Policy:
             protein_sequences=protein_sequences,
         )
 
-    def per_token_logps(self, full_token_ids, full_attention_mask, generated_mask, requires_grad):
+    def per_token_logps(
+        self,
+        full_token_ids,
+        full_attention_mask,
+        generated_mask,
+        requires_grad,
+        return_normalized_entropy=False,
+    ):
         if full_token_ids.dim() != 2:
             raise ValueError('full_token_ids must have shape [batch, seq_len]')
         if full_attention_mask.shape != full_token_ids.shape:
@@ -124,4 +132,13 @@ class ProGen2Policy:
         shifted_mask = generated_mask[:, 1:] & (full_attention_mask[:, 1:] > 0)
         log_probs = torch.log_softmax(shifted_logits.float(), dim=-1)
         gathered = log_probs.gather(dim=-1, index=shifted_targets.unsqueeze(-1)).squeeze(-1)
-        return gathered.unsqueeze(1), shifted_mask
+        if not return_normalized_entropy:
+            return gathered.unsqueeze(1), shifted_mask
+
+        entropy_normalizer = math.log(log_probs.size(-1))
+        if entropy_normalizer <= 0.0:
+            raise ValueError('entropy requires a vocabulary with at least two tokens')
+        normalized_entropy = (
+            -(log_probs.exp() * log_probs).sum(dim=-1) / entropy_normalizer
+        )
+        return gathered.unsqueeze(1), shifted_mask, normalized_entropy.unsqueeze(1)

@@ -43,7 +43,13 @@ def split_tensor_dict(tensor_dict, num_chunks):
     return chunks
 
 
-def selective_log_softmax(logits, index, weights=None, mask=None):
+def selective_log_softmax(
+    logits,
+    index,
+    weights=None,
+    mask=None,
+    return_normalized_entropy=False,
+):
     full_batch_size = logits.size(0) // 3
     if full_batch_size == 0:
         raise ValueError('logits batch size must be at least 3')
@@ -54,6 +60,10 @@ def selective_log_softmax(logits, index, weights=None, mask=None):
     num_iterations = weights.size(0) // 3
     batch_size = full_batch_size // num_iterations
     per_token_logps = []
+    per_token_entropies = []
+    entropy_normalizer = math.log(logits.size(-1))
+    if return_normalized_entropy and entropy_normalizer <= 0.0:
+        raise ValueError('entropy requires a vocabulary with at least two tokens')
 
     for sample_idx in range(full_batch_size):
         labels = index[sample_idx].clone()
@@ -75,7 +85,21 @@ def selective_log_softmax(logits, index, weights=None, mask=None):
         weighted = torch.where(seq_mask, gathered[1] * seq_weights[1], gathered[2] * seq_weights[2])
         per_token_logps.append((gathered[0] + weighted) / 2)
 
-    return torch.stack(per_token_logps, dim=0)
+        if return_normalized_entropy:
+            seq_entropies = -(seq_logps.exp() * seq_logps).sum(dim=-1)
+            weighted_entropy = torch.where(
+                seq_mask,
+                seq_entropies[1] * seq_weights[1],
+                seq_entropies[2] * seq_weights[2],
+            )
+            per_token_entropies.append(
+                ((seq_entropies[0] + weighted_entropy) / 2) / entropy_normalizer
+            )
+
+    stacked_logps = torch.stack(per_token_logps, dim=0)
+    if not return_normalized_entropy:
+        return stacked_logps
+    return stacked_logps, torch.stack(per_token_entropies, dim=0)
 
 
 def forward_process(
@@ -119,6 +143,7 @@ def get_per_token_logps(
     mask_seeds,
     gradient_accumulation_steps,
     requires_grad,
+    return_normalized_entropy=False,
 ):
     if input_ids.dim() != 3:
         raise ValueError(f'Expected input_ids to have 3 dimensions, got {input_ids.dim()}')
@@ -171,11 +196,30 @@ def get_per_token_logps(
         completion_logits = logits[:, -logits_to_keep:, :]
         completion_targets = expanded_input[:, -logits_to_keep:]
         completion_loss_mask = partial_mask[:, -logits_to_keep:]
-        per_token_logps = selective_log_softmax(
+        selective_outputs = selective_log_softmax(
             logits=completion_logits,
             index=completion_targets,
             weights=weights,
             mask=completion_loss_mask,
-        ).view(num_iterations, batch_size, logits_to_keep).permute(1, 0, 2)
+            return_normalized_entropy=return_normalized_entropy,
+        )
+        if return_normalized_entropy:
+            per_token_logps, normalized_entropy = selective_outputs
+            normalized_entropy = normalized_entropy.view(
+                num_iterations,
+                batch_size,
+                logits_to_keep,
+            ).permute(1, 0, 2)
+        else:
+            per_token_logps = selective_outputs
+            normalized_entropy = None
+        per_token_logps = per_token_logps.view(
+            num_iterations,
+            batch_size,
+            logits_to_keep,
+        ).permute(1, 0, 2)
 
-    return per_token_logps.to(torch.float32)
+    per_token_logps = per_token_logps.to(torch.float32)
+    if not return_normalized_entropy:
+        return per_token_logps
+    return per_token_logps, normalized_entropy.to(torch.float32)

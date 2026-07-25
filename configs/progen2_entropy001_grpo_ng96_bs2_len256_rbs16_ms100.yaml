@@ -1,0 +1,57 @@
+model_variant: progen2_sgrpo
+official_code_dir: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_official
+tokenizer_path: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_official/tokenizer.json
+init_checkpoint_dir: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_official/checkpoints/progen2-small
+ref_checkpoint_dir: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_official/checkpoints/progen2-small
+checkpoint_subdir: null
+prompt_path: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_official/prompts_unconditional.txt
+per_device_prompt_batch_size: 2
+gradient_accumulation_steps: 1
+bf16: false
+max_steps: 100
+learning_rate: 5e-5
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_eps: 1e-8
+weight_decay: 0.0
+max_grad_norm: 1.0
+beta: 0.01
+epsilon: 0.2
+logging_steps: 1
+save_steps: 20
+save_total_limit: 3
+report_to: [wandb]
+rl_algorithm: grpo
+num_generations: 96
+supergroup_num_groups: 1
+group_advantage_weight: 0.5
+reward_compute_every_n_steps:
+  naturalness: 1
+  foldability: 4
+  stability: 1
+  developability: 1
+max_new_tokens: 256
+top_p: 0.95
+temperature: 0.8
+reward_calibration_size: 1024
+reward_calibration_prompt_batch_size: 128
+rewards:
+  naturalness:
+    model_name: esm2_t33_650M_UR50D
+    device: cuda
+    batch_size: 256
+  foldability:
+    device: cuda
+    batch_size: 64
+  stability:
+    model_name_or_path: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/temberture_official
+    base_model_name_or_path: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/prot_bert_bfd
+    device: cuda
+    batch_size: 256
+  developability:
+    model_name_or_path: /public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/proteinsol_official
+    device: cuda
+    batch_size: 24
+diverse_minibatch: false
+diverse_minibatch_oversample_factor: 2
+entropy_regularization_weight: 0.01

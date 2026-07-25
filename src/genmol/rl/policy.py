@@ -156,6 +156,7 @@ class GenMolCpGRPOPolicy:
         mask_seeds,
         gradient_accumulation_steps,
         requires_grad,
+        return_normalized_entropy=False,
     ):
         def score_fn(batch):
             return self.forward_logits(batch)
@@ -169,6 +170,7 @@ class GenMolCpGRPOPolicy:
             mask_seeds=mask_seeds,
             gradient_accumulation_steps=gradient_accumulation_steps,
             requires_grad=requires_grad,
+            return_normalized_entropy=return_normalized_entropy,
         )
 
     def _decode_safe_strings(self, token_ids):

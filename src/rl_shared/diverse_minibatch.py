@@ -1,0 +1,400 @@
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class DiverseMiniBatchSelection:
+    indices: tuple[int, ...]
+    active_mask: tuple[bool, ...]
+    metrics: dict[str, float]
+
+
+def validate_diverse_minibatch_config(*, enabled, oversample_factor):
+    if not isinstance(enabled, bool):
+        raise ValueError(f'diverse_minibatch must be boolean, got {enabled!r}')
+    if isinstance(oversample_factor, bool):
+        raise ValueError('diverse_minibatch_oversample_factor must be an integer')
+    try:
+        factor = int(oversample_factor)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'diverse_minibatch_oversample_factor must be an integer'
+        ) from exc
+    if factor != oversample_factor:
+        raise ValueError(
+            'diverse_minibatch_oversample_factor must be an integer, '
+            f'got {oversample_factor!r}'
+        )
+    if enabled and factor <= 1:
+        raise ValueError(
+            'diverse_minibatch_oversample_factor must be greater than 1 '
+            'when diverse_minibatch is enabled'
+        )
+    if not enabled and factor <= 0:
+        raise ValueError('diverse_minibatch_oversample_factor must be positive')
+    return factor
+
+
+def optimization_group_size(num_generations, *, enabled, oversample_factor):
+    if num_generations <= 1:
+        raise ValueError('num_generations must be greater than 1')
+    factor = validate_diverse_minibatch_config(
+        enabled=enabled,
+        oversample_factor=oversample_factor,
+    )
+    if not enabled:
+        return int(num_generations)
+    if int(num_generations) % factor != 0:
+        raise ValueError(
+            'Diverse Mini-Batch GRPO requires num_generations to be divisible '
+            f'by the oversample factor: {num_generations} vs {factor}'
+        )
+    selected_size = int(num_generations) // factor
+    if selected_size <= 1:
+        raise ValueError(
+            'Diverse Mini-Batch GRPO optimization group size must be greater '
+            f'than 1, got {selected_size}'
+        )
+    return selected_size
+
+
+def select_molecule_groups(
+    smiles,
+    *,
+    candidate_size,
+    selected_size,
+    seed,
+):
+    from rdkit.Chem import MolFromSmiles, rdFingerprintGenerator
+
+    if candidate_size <= selected_size:
+        raise ValueError(
+            f'candidate_size must exceed selected_size, got {candidate_size} and {selected_size}'
+        )
+    groups = _validate_grouped_items(smiles, candidate_size)
+    fingerprint_generator = rdFingerprintGenerator.GetMorganGenerator(
+        radius=2,
+        fpSize=2048,
+    )
+
+    started = time.perf_counter()
+    selected_indices = []
+    active_mask = []
+    valid_count = 0
+    dpp_group_count = 0
+    fingerprint_sec = 0.0
+    kernel_sec = 0.0
+    eigensample_sec = 0.0
+
+    for group_idx, group in enumerate(groups):
+        fp_started = time.perf_counter()
+        group_valid_indices = []
+        fingerprints = []
+        for item_idx, item in enumerate(group):
+            if not item:
+                continue
+            molecule = MolFromSmiles(str(item), sanitize=True)
+            if molecule is None:
+                continue
+            group_valid_indices.append(item_idx)
+            fingerprints.append(fingerprint_generator.GetFingerprint(molecule))
+        fingerprint_sec += time.perf_counter() - fp_started
+        valid_count += len(group_valid_indices)
+        if not group_valid_indices:
+            raise RuntimeError(
+                'Diverse Mini-Batch GRPO found no valid molecular candidate in '
+                f'group {group_idx}; refusing to fabricate an optimization sample'
+            )
+
+        if len(group_valid_indices) <= selected_size:
+            group_picks = list(range(len(group_valid_indices)))
+        else:
+            group_picks, timings = _sample_exact_tanimoto_k_dpp(
+                fingerprints,
+                size=selected_size,
+                seed=int(seed) + group_idx,
+            )
+            kernel_sec += timings['kernel_sec']
+            eigensample_sec += timings['eigensample_sec']
+            dpp_group_count += 1
+
+        original_group_picks = sorted(group_valid_indices[idx] for idx in group_picks)
+        padded_picks, group_mask = _pad_group_selection(
+            original_group_picks,
+            selected_size=selected_size,
+        )
+        group_offset = group_idx * candidate_size
+        selected_indices.extend(group_offset + idx for idx in padded_picks)
+        active_mask.extend(group_mask)
+
+    selected_count = sum(active_mask)
+    elapsed = time.perf_counter() - started
+    metrics = _selection_metrics(
+        candidate_count=len(smiles),
+        valid_count=valid_count,
+        selected_count=selected_count,
+        target_count=len(groups) * selected_size,
+        elapsed=elapsed,
+    )
+    metrics.update(
+        {
+            'fingerprint_sec': float(fingerprint_sec),
+            'kernel_sec': float(kernel_sec),
+            'eigensample_sec': float(eigensample_sec),
+            'exact_dpp_group_count': float(dpp_group_count),
+        }
+    )
+    return DiverseMiniBatchSelection(
+        indices=tuple(selected_indices),
+        active_mask=tuple(active_mask),
+        metrics=metrics,
+    )
+
+
+def select_sequence_groups(
+    sequences,
+    *,
+    candidate_size,
+    selected_size,
+    seed,
+):
+    from progen2.rewards.common import (
+        is_valid_protein_sequence,
+        normalize_protein_sequence,
+    )
+
+    if candidate_size <= selected_size:
+        raise ValueError(
+            f'candidate_size must exceed selected_size, got {candidate_size} and {selected_size}'
+        )
+    groups = _validate_grouped_items(sequences, candidate_size)
+    started = time.perf_counter()
+    selected_indices = []
+    active_mask = []
+    valid_count = 0
+    distance_sec = 0.0
+
+    for group_idx, group in enumerate(groups):
+        group_valid_indices = [
+            idx for idx, sequence in enumerate(group)
+            if is_valid_protein_sequence(sequence)
+        ]
+        valid_count += len(group_valid_indices)
+        if not group_valid_indices:
+            raise RuntimeError(
+                'Diverse Mini-Batch GRPO found no valid protein candidate in '
+                f'group {group_idx}; refusing to fabricate an optimization sample'
+            )
+
+        if len(group_valid_indices) <= selected_size:
+            group_picks = list(range(len(group_valid_indices)))
+        else:
+            valid_sequences = [
+                normalize_protein_sequence(group[idx])
+                for idx in group_valid_indices
+            ]
+            distance_started = time.perf_counter()
+            group_picks = _maxmin_edit_distance_selection(
+                valid_sequences,
+                size=selected_size,
+                seed=int(seed) + group_idx,
+            )
+            distance_sec += time.perf_counter() - distance_started
+
+        original_group_picks = sorted(group_valid_indices[idx] for idx in group_picks)
+        padded_picks, group_mask = _pad_group_selection(
+            original_group_picks,
+            selected_size=selected_size,
+        )
+        group_offset = group_idx * candidate_size
+        selected_indices.extend(group_offset + idx for idx in padded_picks)
+        active_mask.extend(group_mask)
+
+    selected_count = sum(active_mask)
+    metrics = _selection_metrics(
+        candidate_count=len(sequences),
+        valid_count=valid_count,
+        selected_count=selected_count,
+        target_count=len(groups) * selected_size,
+        elapsed=time.perf_counter() - started,
+    )
+    metrics['distance_and_maxmin_sec'] = float(distance_sec)
+    return DiverseMiniBatchSelection(
+        indices=tuple(selected_indices),
+        active_mask=tuple(active_mask),
+        metrics=metrics,
+    )
+
+
+def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
+    import numpy as np
+    from rdkit import DataStructs
+
+    try:
+        from dppy.finite_dpps import FiniteDPP
+    except ImportError as exc:
+        raise RuntimeError(
+            'Exact molecular k-DPP selection requires dppy==0.3.3'
+        ) from exc
+
+    if size <= 0 or size > len(fingerprints):
+        raise ValueError(
+            f'k-DPP size must be in [1, {len(fingerprints)}], got {size}'
+        )
+
+    kernel_started = time.perf_counter()
+    likelihood_kernel = np.empty(
+        (len(fingerprints), len(fingerprints)),
+        dtype=np.float64,
+    )
+    for row_idx, fingerprint in enumerate(fingerprints):
+        likelihood_kernel[row_idx] = DataStructs.BulkTanimotoSimilarity(
+            fingerprint,
+            fingerprints,
+        )
+    likelihood_kernel = (likelihood_kernel + likelihood_kernel.T) * 0.5
+    kernel_sec = time.perf_counter() - kernel_started
+
+    eigensample_started = time.perf_counter()
+    eigenvalues, eigenvectors = np.linalg.eigh(likelihood_kernel)
+    scale = max(1.0, float(np.max(np.abs(eigenvalues))))
+    tolerance = (
+        np.finfo(np.float64).eps
+        * max(1, likelihood_kernel.shape[0])
+        * scale
+        * 10.0
+    )
+    if float(eigenvalues.min()) < -tolerance:
+        raise RuntimeError(
+            'Morgan-Tanimoto likelihood kernel is not positive semidefinite '
+            f'within numerical tolerance: min_eigenvalue={float(eigenvalues.min()):.6g}, '
+            f'tolerance={tolerance:.6g}'
+        )
+    eigenvalues = np.where(eigenvalues < 0.0, 0.0, eigenvalues)
+    rank = int((eigenvalues > tolerance).sum())
+    if rank < size:
+        raise RuntimeError(
+            'Exact k-DPP has zero support because the Tanimoto kernel rank is '
+            f'{rank}, below requested subset size {size}'
+        )
+
+    dpp = FiniteDPP(
+        'likelihood',
+        **{'L_eig_dec': (eigenvalues, eigenvectors)},
+    )
+    sample = dpp.sample_exact_k_dpp(
+        size=size,
+        mode='GS',
+        random_state=np.random.RandomState(int(seed)),
+    )
+    eigensample_sec = time.perf_counter() - eigensample_started
+    picks = [int(idx) for idx in sample]
+    if len(picks) != size or len(set(picks)) != size:
+        raise RuntimeError(
+            'Exact k-DPP returned an invalid sample: '
+            f'expected {size} unique indices, got {len(picks)} entries and '
+            f'{len(set(picks))} unique entries'
+        )
+    return picks, {
+        'kernel_sec': float(kernel_sec),
+        'eigensample_sec': float(eigensample_sec),
+    }
+
+
+def _maxmin_edit_distance_selection(sequences, *, size, seed):
+    import numpy as np
+
+    try:
+        from rapidfuzz import process as rapidfuzz_process
+        from rapidfuzz.distance import Levenshtein
+    except ImportError as exc:
+        raise RuntimeError(
+            'Protein MaxMin selection requires rapidfuzz'
+        ) from exc
+
+    if size <= 0 or size > len(sequences):
+        raise ValueError(
+            f'MaxMin size must be in [1, {len(sequences)}], got {size}'
+        )
+    similarities = rapidfuzz_process.cdist(
+        sequences,
+        sequences,
+        scorer=Levenshtein.normalized_similarity,
+        workers=1,
+        dtype=np.float32,
+    )
+    distances = 1.0 - similarities
+    np.fill_diagonal(distances, 0.0)
+
+    rng = np.random.RandomState(int(seed))
+    first = int(rng.randint(len(sequences)))
+    selected = [first]
+    selected_mask = np.zeros(len(sequences), dtype=bool)
+    selected_mask[first] = True
+    min_distance = distances[first].copy()
+    while len(selected) < size:
+        scores = np.where(selected_mask, -np.inf, min_distance)
+        next_idx = int(np.argmax(scores))
+        if selected_mask[next_idx]:
+            raise RuntimeError('MaxMin failed to identify an unselected sequence')
+        selected.append(next_idx)
+        selected_mask[next_idx] = True
+        min_distance = np.minimum(min_distance, distances[next_idx])
+    return selected
+
+
+def _validate_grouped_items(items, group_size):
+    if group_size <= 0:
+        raise ValueError('group_size must be positive')
+    if not items:
+        raise ValueError('candidate items must be non-empty')
+    if len(items) % group_size != 0:
+        raise ValueError(
+            f'candidate count must be divisible by group_size: {len(items)} vs {group_size}'
+        )
+    return [
+        list(items[start:start + group_size])
+        for start in range(0, len(items), group_size)
+    ]
+
+
+def _pad_group_selection(indices, *, selected_size):
+    if not indices:
+        raise RuntimeError('cannot pad an empty selected group')
+    if len(indices) > selected_size:
+        raise ValueError(
+            f'selected group exceeds target size: {len(indices)} vs {selected_size}'
+        )
+    active_count = len(indices)
+    padded = list(indices)
+    padded.extend([indices[0]] * (selected_size - active_count))
+    active_mask = [True] * active_count + [False] * (selected_size - active_count)
+    return padded, active_mask
+
+
+def _selection_metrics(
+    *,
+    candidate_count,
+    valid_count,
+    selected_count,
+    target_count,
+    elapsed,
+):
+    if candidate_count <= 0 or target_count <= 0:
+        raise ValueError('candidate_count and target_count must be positive')
+    if not 0 < selected_count <= target_count:
+        raise ValueError(
+            f'selected_count must be in [1, {target_count}], got {selected_count}'
+        )
+    return {
+        'candidate_count': float(candidate_count),
+        'valid_candidate_count': float(valid_count),
+        'valid_candidate_fraction': float(valid_count / candidate_count),
+        'selected_count': float(selected_count),
+        'target_optimization_count': float(target_count),
+        'shortfall_count': float(target_count - selected_count),
+        'shortfall_fraction': float((target_count - selected_count) / target_count),
+        'selection_sec': float(elapsed),
+    }

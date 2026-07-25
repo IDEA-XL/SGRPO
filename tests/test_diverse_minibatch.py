@@ -66,6 +66,21 @@ class DiverseMiniBatchTest(unittest.TestCase):
         self.assertEqual(len(set(selection.indices)), 3)
         self.assertEqual(selection.metrics['exact_dpp_group_count'], 1.0)
 
+    def test_exact_tanimoto_k_dpp_regularizes_rank_deficient_kernel(self):
+        selection = select_molecule_groups(
+            ['CCO'] * 6,
+            candidate_size=6,
+            selected_size=3,
+            seed=13,
+        )
+        self.assertEqual(sum(selection.active_mask), 3)
+        self.assertEqual(len(set(selection.indices)), 3)
+        self.assertEqual(selection.metrics['raw_kernel_rank_min'], 1.0)
+        self.assertEqual(
+            selection.metrics['regularized_dpp_group_count'],
+            1.0,
+        )
+
     def test_sequence_maxmin_shortfall_masks_padding(self):
         selection = select_sequence_groups(
             ['ACDE', '', 'AX', 'WYYY'],

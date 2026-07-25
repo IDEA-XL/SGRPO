@@ -4,6 +4,9 @@ import time
 from dataclasses import dataclass
 
 
+_DPP_DIAGONAL_JITTER = 1.0e-6
+
+
 @dataclass(frozen=True)
 class DiverseMiniBatchSelection:
     indices: tuple[int, ...]
@@ -87,6 +90,8 @@ def select_molecule_groups(
     fingerprint_sec = 0.0
     kernel_sec = 0.0
     eigensample_sec = 0.0
+    raw_kernel_ranks = []
+    regularized_group_count = 0.0
 
     for group_idx, group in enumerate(groups):
         fp_started = time.perf_counter()
@@ -118,6 +123,8 @@ def select_molecule_groups(
             )
             kernel_sec += timings['kernel_sec']
             eigensample_sec += timings['eigensample_sec']
+            raw_kernel_ranks.append(timings['raw_kernel_rank'])
+            regularized_group_count += timings['regularized']
             dpp_group_count += 1
 
         original_group_picks = sorted(group_valid_indices[idx] for idx in group_picks)
@@ -144,6 +151,16 @@ def select_molecule_groups(
             'kernel_sec': float(kernel_sec),
             'eigensample_sec': float(eigensample_sec),
             'exact_dpp_group_count': float(dpp_group_count),
+            'raw_kernel_rank_min': float(
+                min(raw_kernel_ranks) if raw_kernel_ranks else 0.0
+            ),
+            'raw_kernel_rank_mean': float(
+                sum(raw_kernel_ranks) / len(raw_kernel_ranks)
+                if raw_kernel_ranks
+                else 0.0
+            ),
+            'regularized_dpp_group_count': float(regularized_group_count),
+            'dpp_diagonal_jitter': float(_DPP_DIAGONAL_JITTER),
         }
     )
     return DiverseMiniBatchSelection(
@@ -274,11 +291,13 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
         )
     eigenvalues = np.where(eigenvalues < 0.0, 0.0, eigenvalues)
     rank = int((eigenvalues > tolerance).sum())
-    if rank < size:
-        raise RuntimeError(
-            'Exact k-DPP has zero support because the Tanimoto kernel rank is '
-            f'{rank}, below requested subset size {size}'
-        )
+    regularized = rank < size
+    if regularized:
+        # L + eps*I is full rank. Scaling by 1/eps prevents underflow in the
+        # fixed-cardinality recursion and leaves the k-DPP distribution unchanged.
+        eigenvalues = (
+            eigenvalues + _DPP_DIAGONAL_JITTER
+        ) / _DPP_DIAGONAL_JITTER
 
     dpp = FiniteDPP(
         'likelihood',
@@ -300,6 +319,8 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
     return picks, {
         'kernel_sec': float(kernel_sec),
         'eigensample_sec': float(eigensample_sec),
+        'raw_kernel_rank': float(rank),
+        'regularized': float(regularized),
     }
 
 

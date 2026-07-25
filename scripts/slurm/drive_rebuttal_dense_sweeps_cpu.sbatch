@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=4G
-#SBATCH -t 5-00:00:00
+#SBATCH -t 1-00:00:00
 #SBATCH -J rbdriver
 #SBATCH -o /public/home/xinwuye/ai4s-tool-joint-train/runs/rebuttal_dense_sweep/logs/controller_%j.out
 #SBATCH -e /public/home/xinwuye/ai4s-tool-joint-train/runs/rebuttal_dense_sweep/logs/controller_%j.err

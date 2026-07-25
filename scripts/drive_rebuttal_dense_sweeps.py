@@ -15,13 +15,20 @@ from typing import Callable, Iterable
 
 import yaml
 
-from build_rebuttal_dense_sweep_specs import REPO_REMOTE_ROOT, RUN_OUTPUT_ROOT, SEEDS
+from build_rebuttal_dense_sweep_specs import (
+    REPO_REMOTE_ROOT,
+    RUN_OUTPUT_ROOT as DEFAULT_RUN_OUTPUT_ROOT,
+    SEEDS,
+)
 
 
 SLURM_ROOT = Path("/opt/gridview/slurm/bin")
 SBATCH = SLURM_ROOT / "sbatch"
 SQUEUE = SLURM_ROOT / "squeue"
 SACCT = SLURM_ROOT / "sacct"
+RUN_OUTPUT_ROOT = Path(
+    os.environ.get("REBUTTAL_RUN_OUTPUT_ROOT", str(DEFAULT_RUN_OUTPUT_ROOT))
+)
 SPEC_ROOT = RUN_OUTPUT_ROOT / "specs"
 LOG_ROOT = RUN_OUTPUT_ROOT / "logs"
 STATE_PATH = RUN_OUTPUT_ROOT / "controller_state.json"
@@ -195,6 +202,20 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
     tasks: dict[str, TaskSpec] = {}
 
     denovo_rows = _read_tsv(SPEC_ROOT / "denovo/tasks.tsv")
+    denovo_rows_per_seed = {
+        seed: [row for row in denovo_rows if int(row["seed"]) == seed]
+        for seed in SEEDS
+    }
+    if any(not rows for rows in denovo_rows_per_seed.values()):
+        raise ValueError("Every de novo seed must have at least one experiment")
+    denovo_experiment_counts = {
+        len(rows) for rows in denovo_rows_per_seed.values()
+    }
+    if len(denovo_experiment_counts) != 1:
+        raise ValueError(
+            f"De novo experiment counts differ across seeds: {denovo_experiment_counts}"
+        )
+    denovo_expected_experiments = next(iter(denovo_experiment_counts))
     _add_group(
         groups,
         GroupSpec(
@@ -205,13 +226,20 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
             output_pattern=LOG_ROOT / "denovo_%A_%a.out",
             error_pattern=LOG_ROOT / "denovo_%A_%a.err",
             time_limit="01:00:00",
+            exports=(("TASKS_PATH", str(SPEC_ROOT / "denovo/tasks.tsv")),),
         ),
     )
     denovo_keys = []
+    denovo_expected_rows = {seed: 0 for seed in SEEDS}
     for row in denovo_rows:
         task_id = int(row["task_id"])
+        seed = int(row["seed"])
         config = yaml.safe_load(Path(row["config_path"]).read_text())
         output_path = Path(config["output_json_path"])
+        expected_points = len(config["randomness_temperature_pairs"])
+        if expected_points <= 0:
+            raise ValueError(f"Empty de novo sweep in {row['config_path']}")
+        denovo_expected_rows[seed] += expected_points
         key = f"denovo:{task_id}"
         denovo_keys.append(key)
         _add_task(
@@ -221,7 +249,9 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 group="denovo",
                 array_id=task_id,
                 prerequisites=(),
-                validator=lambda path=output_path: _json_has_length(path, 10),
+                validator=lambda path=output_path, expected=expected_points: _json_has_length(
+                    path, expected
+                ),
             ),
         )
 
@@ -239,6 +269,10 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
             job_name="rbdenagg",
             output_pattern=LOG_ROOT / "denovo_aggregate_%j.out",
             error_pattern=LOG_ROOT / "denovo_aggregate_%j.err",
+            exports=(
+                ("RUN_ROOT", str(RUN_OUTPUT_ROOT)),
+                ("EXPECTED_EXPERIMENTS", str(denovo_expected_experiments)),
+            ),
         ),
     )
     _add_task(
@@ -249,8 +283,10 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
             array_id=None,
             prerequisites=tuple(denovo_keys),
             validator=_all_valid(
-                lambda path=path: _json_has_length(path, 120)
-                for path in denovo_aggregate_paths
+                lambda path=path, expected=denovo_expected_rows[seed]: _json_has_length(
+                    path, expected
+                )
+                for seed, path in zip(SEEDS, denovo_aggregate_paths)
             ),
         ),
     )
@@ -309,6 +345,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                     ("TASKS_PATH", str(tasks_path)),
                     ("DOCKING_ROOT", str(docking_root)),
                     ("OUTPUT_DIR", str(aggregate_root)),
+                    ("EXPECTED_NUM_TASKS", str(len(rows))),
                 ),
             ),
         )
@@ -358,7 +395,9 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 array_id=None,
                 prerequisites=tuple(docking_keys),
                 validator=lambda path=aggregate_root
-                / "mmgenmol_dense.json": _json_has_length(path, 30),
+                / "mmgenmol_dense.json", expected=len(rows): _json_has_length(
+                    path, expected
+                ),
             ),
         )
 
@@ -568,6 +607,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
         )
         aggregate_key = f"p2:{seed}:aggregate"
         progen2_aggregate_keys.append(aggregate_key)
+        expected_progen2_rows = len(rows)
         _add_task(
             tasks,
             TaskSpec(
@@ -581,8 +621,10 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                     *developability_keys,
                     *diversity_keys,
                 ),
-                validator=lambda path=Path(config["output_json_path"]): _json_has_length(
-                    path, 92, field="results"
+                validator=lambda path=Path(
+                    config["output_json_path"]
+                ), expected=expected_progen2_rows: _json_has_length(
+                    path, expected, field="results"
                 ),
             ),
         )

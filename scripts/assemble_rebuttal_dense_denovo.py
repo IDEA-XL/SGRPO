@@ -20,22 +20,41 @@ def main() -> None:
         type=Path,
         default=Path("/public/home/xinwuye/ai4s-tool-joint-train/runs/rebuttal_dense_sweep"),
     )
+    parser.add_argument(
+        "--expected-experiments",
+        type=int,
+        default=EXPECTED_EXPERIMENTS,
+    )
+    parser.add_argument(
+        "--expected-points-per-experiment",
+        type=int,
+        default=EXPECTED_POINTS_PER_EXPERIMENT,
+    )
     args = parser.parse_args()
+    if args.expected_experiments <= 0:
+        raise ValueError("--expected-experiments must be positive")
+    if args.expected_points_per_experiment <= 0:
+        raise ValueError("--expected-points-per-experiment must be positive")
 
     for seed in SEEDS:
         seed_root = args.run_root / "denovo" / f"seed{seed}"
         paths = sorted(seed_root.glob("*/*/aggregate/dense.json"))
-        if len(paths) != EXPECTED_EXPERIMENTS:
+        if len(paths) != args.expected_experiments:
             raise RuntimeError(
-                f"Expected {EXPECTED_EXPERIMENTS} experiment summaries for seed {seed}, found {len(paths)}"
+                f"Expected {args.expected_experiments} experiment summaries for seed "
+                f"{seed}, found {len(paths)}"
             )
         merged = []
         experiments = set()
         for path in paths:
             rows = json.loads(path.read_text())
-            if not isinstance(rows, list) or len(rows) != EXPECTED_POINTS_PER_EXPERIMENT:
+            if (
+                not isinstance(rows, list)
+                or len(rows) != args.expected_points_per_experiment
+            ):
                 raise RuntimeError(
-                    f"Expected {EXPECTED_POINTS_PER_EXPERIMENT} rows in {path}, found {len(rows)}"
+                    f"Expected {args.expected_points_per_experiment} rows in {path}, "
+                    f"found {len(rows)}"
                 )
             row_experiments = {str(row["experiment"]) for row in rows}
             if len(row_experiments) != 1:

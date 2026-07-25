@@ -14,6 +14,7 @@ REPO_DIR=/public/home/xinwuye/ai4s-tool-joint-train/genmol
 : "${TASKS_PATH:?TASKS_PATH is required}"
 : "${DOCKING_ROOT:?DOCKING_ROOT is required}"
 : "${OUTPUT_DIR:?OUTPUT_DIR is required}"
+EXPECTED_NUM_TASKS=${EXPECTED_NUM_TASKS:-30}
 
 source /public/home/xinwuye/miniconda/etc/profile.d/conda.sh
 conda activate genmol
@@ -26,7 +27,7 @@ python scripts/aggregate_mmgenmol_sweep_results.py \
   --docking_root "${DOCKING_ROOT}" \
   --output_dir "${OUTPUT_DIR}" \
   --output_prefix mmgenmol_dense \
-  --expected_num_tasks 30 \
+  --expected_num_tasks "${EXPECTED_NUM_TASKS}" \
   --expected_rows_per_task 1600 \
   --expected_num_pockets 100 \
   --expected_samples_per_pocket 16 \

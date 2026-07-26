@@ -63,14 +63,77 @@ def apply_reward_gate(soft_reward, is_valid, alert_hit):
     return float(soft_reward)
 
 
-def compute_internal_diversity(smiles_list):
+def combine_candidate_diversity_reward(
+    base_soft_reward,
+    raw_loo_credit,
+    *,
+    weight,
+    is_valid,
+    alert_hit,
+):
+    weight = float(weight)
+    if not 0.0 <= weight <= 1.0:
+        raise ValueError(
+            f'candidate diversity reward weight must be in [0, 1], got {weight}'
+        )
+    if not is_valid:
+        return -1.0
+    if base_soft_reward is None:
+        raise ValueError(
+            'base_soft_reward is required for a valid candidate'
+        )
+    combined_reward = (
+        (1.0 - weight) * float(base_soft_reward)
+        + weight * float(raw_loo_credit)
+    )
+    return apply_reward_gate(
+        combined_reward,
+        is_valid=True,
+        alert_hit=alert_hit,
+    )
+
+
+def _compute_internal_diversity_statistics(smiles_list):
     indexed_fingerprints = _compute_indexed_fingerprints(smiles_list)
     if len(indexed_fingerprints) < 2:
-        return 0.0
-    similarity_sum, pair_count, _ = _compute_pairwise_similarity_stats(indexed_fingerprints)
+        return 0.0, [0.0 for _ in smiles_list]
+
+    similarity_sum, pair_count, per_fingerprint_similarity_sum = (
+        _compute_pairwise_similarity_stats(indexed_fingerprints)
+    )
     if pair_count == 0:
-        return 0.0
-    return 1.0 - (similarity_sum / pair_count)
+        return 0.0, [0.0 for _ in smiles_list]
+
+    full_diversity = 1.0 - (similarity_sum / pair_count)
+    credits = [0.0 for _ in smiles_list]
+    valid_count = len(indexed_fingerprints)
+    reduced_count = valid_count - 1
+    reduced_pair_count = reduced_count * (reduced_count - 1) // 2
+
+    for fingerprint_idx, (original_idx, _) in enumerate(indexed_fingerprints):
+        if reduced_pair_count == 0:
+            reduced_diversity = 0.0
+        else:
+            reduced_similarity_sum = (
+                similarity_sum
+                - per_fingerprint_similarity_sum[fingerprint_idx]
+            )
+            reduced_diversity = (
+                1.0 - (reduced_similarity_sum / reduced_pair_count)
+            )
+        credits[original_idx] = full_diversity - reduced_diversity
+    return full_diversity, credits
+
+
+def compute_internal_diversity(smiles_list):
+    diversity, _ = _compute_internal_diversity_statistics(smiles_list)
+    return diversity
+
+
+def compute_internal_diversity_with_loo_credits(smiles_list):
+    if len(smiles_list) < 2:
+        raise ValueError('LOO diversity credit requires at least two rollouts')
+    return _compute_internal_diversity_statistics(smiles_list)
 
 
 def _compute_indexed_fingerprints(smiles_list):
@@ -89,44 +152,38 @@ def _compute_indexed_fingerprints(smiles_list):
 
 
 def _compute_pairwise_similarity_stats(indexed_fingerprints):
+    import numpy as np
     from rdkit import DataStructs
 
     fingerprints = [fingerprint for _, fingerprint in indexed_fingerprints]
     similarity_sum = 0.0
     pair_count = 0
-    per_fingerprint_similarity_sum = [0.0 for _ in fingerprints]
-    for left_idx in range(len(fingerprints)):
-        for right_idx in range(left_idx + 1, len(fingerprints)):
-            similarity = float(DataStructs.TanimotoSimilarity(fingerprints[left_idx], fingerprints[right_idx]))
-            similarity_sum += similarity
-            per_fingerprint_similarity_sum[left_idx] += similarity
-            per_fingerprint_similarity_sum[right_idx] += similarity
-            pair_count += 1
-    return similarity_sum, pair_count, per_fingerprint_similarity_sum
+    per_fingerprint_similarity_sum = np.zeros(
+        len(fingerprints),
+        dtype=np.float64,
+    )
+    for left_idx in range(len(fingerprints) - 1):
+        similarities = np.asarray(
+            DataStructs.BulkTanimotoSimilarity(
+                fingerprints[left_idx],
+                fingerprints[left_idx + 1:],
+            ),
+            dtype=np.float64,
+        )
+        row_similarity_sum = float(similarities.sum())
+        similarity_sum += row_similarity_sum
+        per_fingerprint_similarity_sum[left_idx] += row_similarity_sum
+        per_fingerprint_similarity_sum[left_idx + 1:] += similarities
+        pair_count += int(similarities.size)
+    return (
+        similarity_sum,
+        pair_count,
+        per_fingerprint_similarity_sum.tolist(),
+    )
 
 
 def compute_internal_diversity_loo_credits(smiles_list):
-    if len(smiles_list) < 2:
-        raise ValueError('LOO diversity credit requires at least two rollouts')
-
-    indexed_fingerprints = _compute_indexed_fingerprints(smiles_list)
-    if len(indexed_fingerprints) < 2:
-        return [0.0 for _ in smiles_list]
-
-    similarity_sum, pair_count, per_fingerprint_similarity_sum = _compute_pairwise_similarity_stats(indexed_fingerprints)
-    full_diversity = 1.0 - (similarity_sum / pair_count)
-    credits = [0.0 for _ in smiles_list]
-    valid_count = len(indexed_fingerprints)
-    reduced_count = valid_count - 1
-    reduced_pair_count = reduced_count * (reduced_count - 1) // 2
-
-    for fingerprint_idx, (original_idx, _) in enumerate(indexed_fingerprints):
-        if reduced_pair_count == 0:
-            reduced_diversity = 0.0
-        else:
-            reduced_similarity_sum = similarity_sum - per_fingerprint_similarity_sum[fingerprint_idx]
-            reduced_diversity = 1.0 - (reduced_similarity_sum / reduced_pair_count)
-        credits[original_idx] = full_diversity - reduced_diversity
+    _, credits = compute_internal_diversity_with_loo_credits(smiles_list)
     return credits
 
 

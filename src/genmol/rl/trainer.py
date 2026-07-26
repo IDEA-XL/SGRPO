@@ -30,8 +30,9 @@ from genmol.rl.reward import (
     MOLECULAR_REWARD_NAME_ORDER,
     MolecularReward,
     RewardRecord,
+    combine_candidate_diversity_reward,
     compute_internal_diversity,
-    compute_internal_diversity_loo_credits,
+    compute_internal_diversity_with_loo_credits,
     normalize_molecular_reward_weights,
 )
 from genmol.rl.specs import (
@@ -117,6 +118,7 @@ class TrainConfig:
     diverse_minibatch: bool = False
     diverse_minibatch_oversample_factor: int = 2
     entropy_regularization_weight: float = 0.0
+    candidate_diversity_reward_weight: float = 0.0
 
 
 @dataclass
@@ -175,6 +177,13 @@ def load_config(path):
     )
     if config.entropy_regularization_weight < 0.0:
         raise ValueError('entropy_regularization_weight must be non-negative')
+    config.candidate_diversity_reward_weight = float(
+        config.candidate_diversity_reward_weight
+    )
+    if not 0.0 <= config.candidate_diversity_reward_weight <= 1.0:
+        raise ValueError(
+            'candidate_diversity_reward_weight must be in [0, 1]'
+        )
     config.rollout_reward_weights = normalize_molecular_reward_weights(
         {
             'qed': config.qed,
@@ -250,6 +259,25 @@ def load_config(path):
         if config.diversity_regularizer_weight != 0.0:
             raise ValueError(
                 'entropy regularization and diversity_regularizer_weight cannot be enabled together'
+            )
+    if config.candidate_diversity_reward_weight > 0.0:
+        if config.rl_algorithm != 'coupled_grpo':
+            raise ValueError(
+                'candidate diversity reward is only supported when rl_algorithm=coupled_grpo'
+            )
+        incompatible_options = []
+        if config.hbd:
+            incompatible_options.append('hbd')
+        if config.diverse_minibatch:
+            incompatible_options.append('diverse_minibatch')
+        if config.entropy_regularization_weight > 0.0:
+            incompatible_options.append('entropy_regularization_weight')
+        if config.diversity_regularizer_weight > 0.0:
+            incompatible_options.append('diversity_regularizer_weight')
+        if incompatible_options:
+            raise ValueError(
+                'candidate diversity reward cannot be combined with: '
+                + ', '.join(incompatible_options)
             )
     return config
 
@@ -614,6 +642,9 @@ class GenMolCpGRPOTrainer:
         ):
             if name in metadata:
                 self._last_reward_metrics[mode][name] = float(metadata[name])
+        for name, value in metadata.items():
+            if name.startswith('candidate_diversity/'):
+                self._last_reward_metrics[mode][name] = float(value)
         bucket['reward'].append(float(metadata['reward_mean']))
         bucket['reward_std'].append(float(metadata['reward_std']))
         bucket['advantage_mean'].append(float(metadata['advantage_mean']))
@@ -654,7 +685,9 @@ class GenMolCpGRPOTrainer:
             if name in metadata:
                 bucket[name].append(float(metadata[name]))
         for name, value in metadata.items():
-            if name.startswith('diverse_minibatch/'):
+            if name.startswith(
+                ('diverse_minibatch/', 'candidate_diversity/')
+            ):
                 bucket[name].append(float(value))
 
     def _record_loss_metrics(self, mode, step_metrics):
@@ -741,6 +774,223 @@ class GenMolCpGRPOTrainer:
         for shard in gathered:
             merged.extend(shard)
         return merged
+
+    def _compute_group_diversity_statistics(
+        self,
+        global_smiles,
+        *,
+        include_loo_credits,
+    ):
+        if len(global_smiles) != self.global_sample_count:
+            raise ValueError(
+                'global smiles count must match global sample count: '
+                f'{len(global_smiles)} vs {self.global_sample_count}'
+            )
+
+        payload = None
+        if self.accelerator.is_main_process:
+            group_diversities = []
+            group_loo_credits = [] if include_loo_credits else None
+            for group_start in range(
+                0,
+                len(global_smiles),
+                self.config.num_generations,
+            ):
+                group_smiles = global_smiles[
+                    group_start:group_start + self.config.num_generations
+                ]
+                if len(group_smiles) != self.config.num_generations:
+                    raise ValueError(
+                        'incomplete rollout group while computing diversity: '
+                        f'{len(group_smiles)} vs {self.config.num_generations}'
+                    )
+                if include_loo_credits:
+                    group_diversity, loo_credits = (
+                        compute_internal_diversity_with_loo_credits(
+                            group_smiles
+                        )
+                    )
+                    group_loo_credits.extend(loo_credits)
+                else:
+                    group_diversity = compute_internal_diversity(
+                        group_smiles
+                    )
+                group_diversities.append(group_diversity)
+            payload = {
+                'group_diversities': group_diversities,
+                'group_loo_credits': group_loo_credits,
+            }
+
+        payload = broadcast_object(payload, self.accelerator)
+        if payload is None:
+            raise RuntimeError(
+                'group diversity statistics were not broadcast'
+            )
+        group_diversities = payload['group_diversities']
+        if len(group_diversities) != self.num_groups_global:
+            raise RuntimeError(
+                'group diversity count mismatch: '
+                f'{len(group_diversities)} vs {self.num_groups_global}'
+            )
+        group_diversity_tensor = torch.tensor(
+            group_diversities,
+            device=self.device,
+            dtype=torch.float32,
+        )
+
+        group_loo_credits = payload['group_loo_credits']
+        if not include_loo_credits:
+            if group_loo_credits is not None:
+                raise RuntimeError(
+                    'unexpected LOO credits when they were not requested'
+                )
+            return group_diversity_tensor, None
+        if len(group_loo_credits) != self.global_sample_count:
+            raise RuntimeError(
+                'group LOO credit count mismatch: '
+                f'{len(group_loo_credits)} vs {self.global_sample_count}'
+            )
+        return (
+            group_diversity_tensor,
+            torch.tensor(
+                group_loo_credits,
+                device=self.device,
+                dtype=torch.float32,
+            ),
+        )
+
+    def _apply_candidate_diversity_reward(
+        self,
+        *,
+        global_soft_rewards,
+        global_valid_mask,
+        global_alert_mask,
+        global_loo_credits,
+        global_group_diversities,
+    ):
+        expected_shape = (self.global_sample_count,)
+        for name, tensor in (
+            ('global_soft_rewards', global_soft_rewards),
+            ('global_valid_mask', global_valid_mask),
+            ('global_alert_mask', global_alert_mask),
+            ('global_loo_credits', global_loo_credits),
+        ):
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f'{name} must have shape {expected_shape}, '
+                    f'got {tuple(tensor.shape)}'
+                )
+        expected_group_shape = (self.num_groups_global,)
+        if tuple(global_group_diversities.shape) != expected_group_shape:
+            raise ValueError(
+                'global_group_diversities must have shape '
+                f'{expected_group_shape}, '
+                f'got {tuple(global_group_diversities.shape)}'
+            )
+        if not torch.isfinite(
+            global_soft_rewards[global_valid_mask]
+        ).all():
+            raise ValueError(
+                'valid candidates must have finite soft rewards'
+            )
+        if not torch.isfinite(global_loo_credits).all():
+            raise ValueError('raw LOO diversity credits must be finite')
+        if not torch.isfinite(global_group_diversities).all():
+            raise ValueError('group diversities must be finite')
+
+        payload = None
+        if self.accelerator.is_main_process:
+            soft_values = global_soft_rewards.tolist()
+            valid_values = global_valid_mask.tolist()
+            alert_values = global_alert_mask.tolist()
+            loo_values = global_loo_credits.tolist()
+            final_rewards = [
+                combine_candidate_diversity_reward(
+                    None if not is_valid else soft_reward,
+                    loo_credit,
+                    weight=self.config.candidate_diversity_reward_weight,
+                    is_valid=is_valid,
+                    alert_hit=alert_hit,
+                )
+                for soft_reward, loo_credit, is_valid, alert_hit in zip(
+                    soft_values,
+                    loo_values,
+                    valid_values,
+                    alert_values,
+                )
+            ]
+
+            valid_loo_credits = global_loo_credits[
+                global_valid_mask
+            ].to(dtype=torch.float32)
+            final_reward_tensor = torch.tensor(
+                final_rewards,
+                dtype=torch.float32,
+            )
+
+            def _summarize(values):
+                if values.numel() == 0:
+                    return {
+                        'mean': float('nan'),
+                        'std': float('nan'),
+                        'min': float('nan'),
+                        'max': float('nan'),
+                    }
+                return {
+                    'mean': values.mean().item(),
+                    'std': values.std(unbiased=False).item(),
+                    'min': values.min().item(),
+                    'max': values.max().item(),
+                }
+
+            raw_loo_summary = _summarize(valid_loo_credits)
+            combined_summary = _summarize(final_reward_tensor)
+            metrics = {
+                'enabled': 1.0,
+                'weight': float(
+                    self.config.candidate_diversity_reward_weight
+                ),
+                'valid_count': float(valid_loo_credits.numel()),
+                'group_diversity_mean': (
+                    global_group_diversities.mean().item()
+                ),
+            }
+            metrics.update(
+                {
+                    f'raw_loo_{name}': value
+                    for name, value in raw_loo_summary.items()
+                }
+            )
+            metrics.update(
+                {
+                    f'combined_reward_{name}': value
+                    for name, value in combined_summary.items()
+                }
+            )
+            payload = {
+                'final_rewards': final_rewards,
+                'metrics': metrics,
+            }
+
+        payload = broadcast_object(payload, self.accelerator)
+        if payload is None:
+            raise RuntimeError(
+                'candidate diversity rewards were not broadcast'
+            )
+        final_rewards = payload['final_rewards']
+        if len(final_rewards) != self.global_sample_count:
+            raise RuntimeError(
+                'candidate diversity reward count mismatch: '
+                f'{len(final_rewards)} vs {self.global_sample_count}'
+            )
+        return (
+            torch.tensor(
+                final_rewards,
+                device=self.device,
+                dtype=torch.float32,
+            ),
+            payload['metrics'],
+        )
 
     def _apply_hbd(self, *, global_items, global_memory_scores, global_reward_values):
         if self._hbd_memory is None:
@@ -924,12 +1174,41 @@ class GenMolCpGRPOTrainer:
             rollout,
             local_active_mask,
         )
-        local_rewards = torch.tensor([record.reward for record in reward_records], device=self.device, dtype=torch.float32)
+        local_rewards = torch.tensor(
+            [record.reward for record in reward_records],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        local_valid = torch.tensor(
+            [record.is_valid for record in reward_records],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        local_alert = torch.tensor(
+            [record.alert_hit for record in reward_records],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        local_soft = torch.tensor(
+            [
+                float('nan')
+                if record.soft_reward is None
+                else float(record.soft_reward)
+                for record in reward_records
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
         global_rewards = self.accelerator.gather(local_rewards).detach()
         global_active_mask = self.accelerator.gather(local_active_mask).detach()
+        gathered_valid = self.accelerator.gather(local_valid).detach()
+        gathered_alert = self.accelerator.gather(local_alert).detach()
+        gathered_soft = self.accelerator.gather(local_soft).detach()
         local_start = self.accelerator.process_index * self.local_sample_count
         local_end = local_start + self.local_sample_count
         hbd_metrics = {}
+        candidate_diversity_metrics = {}
+        local_candidate_loo_credits = None
         global_group_rewards = None
         global_group_reward_credits = None
         global_group_mean_individual_rewards = None
@@ -937,8 +1216,11 @@ class GenMolCpGRPOTrainer:
             self.config.rl_algorithm == 'coupled_sgrpo'
             or self.config.diversity_regularizer_weight > 0.0
             or self._hbd_memory is not None
+            or self.config.candidate_diversity_reward_weight > 0.0
         ):
-            global_smiles = self._all_gather_objects([record.smiles for record in reward_records])
+            global_smiles = self._all_gather_objects(
+                [record.smiles for record in reward_records]
+            )
             if len(global_smiles) != self.global_sample_count:
                 raise ValueError(
                     f'Expected {self.global_sample_count} gathered smiles, got {len(global_smiles)}'
@@ -958,21 +1240,38 @@ class GenMolCpGRPOTrainer:
                     global_memory_scores=global_soft_for_hbd,
                     global_reward_values=global_rewards,
                 )
-            group_diversities = []
-            group_diversity_credits = []
-            for group_start in range(0, len(global_smiles), self.config.num_generations):
-                group_smiles = global_smiles[group_start:group_start + self.config.num_generations]
-                group_diversities.append(
-                    compute_internal_diversity(group_smiles)
+            include_loo_credits = (
+                self.config.candidate_diversity_reward_weight > 0.0
+                or (
+                    self.config.rl_algorithm == 'coupled_sgrpo'
+                    and self.config.group_rewrad_credit == 'loo'
                 )
-                if self.config.group_rewrad_credit == 'loo':
-                    group_diversity_credits.extend(compute_internal_diversity_loo_credits(group_smiles))
-            global_group_rewards = torch.tensor(group_diversities, device=self.device, dtype=torch.float32)
-            if self.config.group_rewrad_credit == 'loo':
-                global_group_reward_credits = torch.tensor(
-                    group_diversity_credits,
-                    device=self.device,
-                    dtype=torch.float32,
+            )
+            (
+                global_group_rewards,
+                global_group_reward_credits,
+            ) = self._compute_group_diversity_statistics(
+                global_smiles,
+                include_loo_credits=include_loo_credits,
+            )
+            if self.config.candidate_diversity_reward_weight > 0.0:
+                if global_group_reward_credits is None:
+                    raise RuntimeError(
+                        'candidate diversity reward requires LOO credits'
+                    )
+                (
+                    global_rewards,
+                    candidate_diversity_metrics,
+                ) = self._apply_candidate_diversity_reward(
+                    global_soft_rewards=gathered_soft,
+                    global_valid_mask=gathered_valid,
+                    global_alert_mask=gathered_alert,
+                    global_loo_credits=global_group_reward_credits,
+                    global_group_diversities=global_group_rewards,
+                )
+                local_candidate_loo_credits = (
+                    global_group_reward_credits[local_start:local_end]
+                    .to(device=self.device)
                 )
         if self.config.rl_algorithm == 'coupled_sgrpo' and _has_active_individual_reward_thresholds(
             self.config.individual_reward_thresholds
@@ -1042,6 +1341,12 @@ class GenMolCpGRPOTrainer:
                     sgrpo_metrics['group_rewrad_credit_loo_enabled']
                 ),
             }
+        extra_advantage_metrics.update(
+            {
+                f'candidate_diversity/{key}': float(value)
+                for key, value in candidate_diversity_metrics.items()
+            }
+        )
         if self.config.diversity_regularizer_weight > 0.0:
             if global_group_rewards is None:
                 raise ValueError('global_group_rewards must be populated when diversity_regularizer_weight > 0')
@@ -1066,8 +1371,6 @@ class GenMolCpGRPOTrainer:
         extra_advantage_metrics.update(selection_metrics)
         local_final_rewards = global_rewards[local_start:local_end].to(device=self.device)
 
-        local_valid = torch.tensor([float(record.is_valid) for record in reward_records], device=self.device)
-        local_alert = torch.tensor([float(record.alert_hit) for record in reward_records], device=self.device)
         local_qed = torch.tensor(
             [float('nan') if record.qed is None else float(record.qed) for record in reward_records],
             device=self.device,
@@ -1080,18 +1383,11 @@ class GenMolCpGRPOTrainer:
             [float('nan') if record.sa_score is None else float(record.sa_score) for record in reward_records],
             device=self.device,
         )
-        local_soft = torch.tensor(
-            [float('nan') if record.soft_reward is None else float(record.soft_reward) for record in reward_records],
-            device=self.device,
-        )
         local_lengths = rollout.completion_mask.sum(dim=1).float()
 
-        gathered_valid = self.accelerator.gather(local_valid)
-        gathered_alert = self.accelerator.gather(local_alert)
         gathered_qed = self.accelerator.gather(local_qed)
         gathered_sa = self.accelerator.gather(local_sa)
         gathered_sa_score = self.accelerator.gather(local_sa_score)
-        gathered_soft = self.accelerator.gather(local_soft)
         gathered_lengths = self.accelerator.gather(local_lengths)
         gathered_advantages = self.accelerator.gather(local_advantages.detach())
 
@@ -1124,32 +1420,44 @@ class GenMolCpGRPOTrainer:
             )
 
         log_rows = []
-        for spec, safe_string, record, final_reward, is_active in zip(
-            local_specs,
-            rollout.safe_strings,
-            reward_records,
-            local_final_rewards.tolist(),
-            local_active_mask.tolist(),
+        for row_idx, (
+            spec,
+            safe_string,
+            record,
+            final_reward,
+            is_active,
+        ) in enumerate(
+            zip(
+                local_specs,
+                rollout.safe_strings,
+                reward_records,
+                local_final_rewards.tolist(),
+                local_active_mask.tolist(),
+            )
         ):
             if not is_active:
                 continue
-            log_rows.append(
-                {
-                    'mode': mode,
-                    'buffer_cycle': self.generation_cycle_idx,
-                    'step': self.global_step,
-                    'spec': spec.__dict__,
-                    'safe': safe_string,
-                    'smiles': record.smiles,
-                    'reward': float(final_reward),
-                    'qed': record.qed,
-                    'sa': record.sa,
-                    'sa_score': record.sa_score,
-                    'soft_reward': record.soft_reward,
-                    'is_valid': record.is_valid,
-                    'alert_hit': record.alert_hit,
-                }
-            )
+            row = {
+                'mode': mode,
+                'buffer_cycle': self.generation_cycle_idx,
+                'step': self.global_step,
+                'spec': spec.__dict__,
+                'safe': safe_string,
+                'smiles': record.smiles,
+                'reward': float(final_reward),
+                'qed': record.qed,
+                'sa': record.sa,
+                'sa_score': record.sa_score,
+                'soft_reward': record.soft_reward,
+                'is_valid': record.is_valid,
+                'alert_hit': record.alert_hit,
+            }
+            if local_candidate_loo_credits is not None:
+                row['raw_loo_diversity_reward'] = float(
+                    local_candidate_loo_credits[row_idx].item()
+                )
+                row['combined_reward'] = float(final_reward)
+            log_rows.append(row)
 
         active_global_rewards = global_rewards[global_active_mask]
         active_global_reward_std = global_reward_std[global_active_mask]
@@ -1157,6 +1465,12 @@ class GenMolCpGRPOTrainer:
         active_gathered_lengths = gathered_lengths[global_active_mask]
         active_gathered_valid = gathered_valid[global_active_mask]
         active_gathered_alert = gathered_alert[global_active_mask]
+        valid_fraction = (
+            active_gathered_valid.to(dtype=torch.float32).mean().item()
+        )
+        alert_hit_fraction = (
+            active_gathered_alert.to(dtype=torch.float32).mean().item()
+        )
         metadata = {
             'buffer_cycle': self.generation_cycle_idx,
             'reward_mean': active_global_rewards.mean().item(),
@@ -1164,9 +1478,9 @@ class GenMolCpGRPOTrainer:
             'advantage_mean': active_gathered_advantages.mean().item(),
             'zero_std_ratio': zero_std_ratio,
             'completion_length': active_gathered_lengths.mean().item(),
-            'valid_fraction': active_gathered_valid.mean().item(),
-            'alert_hit_fraction': active_gathered_alert.mean().item(),
-            'invalid_fraction': 1.0 - active_gathered_valid.mean().item(),
+            'valid_fraction': valid_fraction,
+            'alert_hit_fraction': alert_hit_fraction,
+            'invalid_fraction': 1.0 - valid_fraction,
             'rewards/qed_mean': _nanmean(gathered_qed),
             'rewards/sa_mean': _nanmean(gathered_sa),
             'rewards/sa_score_mean': _nanmean(gathered_sa_score),
@@ -1352,6 +1666,17 @@ class GenMolCpGRPOTrainer:
         for name, values in bucket.items():
             if name.startswith('diverse_minibatch/') and values:
                 metrics[name] = _aggregate_scalar_list(values)
+            if (
+                name.startswith('candidate_diversity/')
+                and (values or name in last_reward_metrics)
+            ):
+                metrics[name] = _reward_metric(name)
+        for name in last_reward_metrics:
+            if (
+                name.startswith('candidate_diversity/')
+                and name not in metrics
+            ):
+                metrics[name] = _reward_metric(name)
         metrics['reward_mean'] = metrics['reward']
         if bucket['kl']:
             metrics['kl'] = _aggregate_scalar_list(bucket['kl'])
@@ -1422,6 +1747,16 @@ class GenMolCpGRPOTrainer:
                     ''
                     if 'diversity_regularizer/loss' not in metrics
                     else f" diversity_regularizer/loss={metrics['diversity_regularizer/loss']:.6f}"
+                )
+                + (
+                    ''
+                    if 'candidate_diversity/raw_loo_mean' not in metrics
+                    else (
+                        f" candidate_diversity/raw_loo_mean="
+                        f"{metrics['candidate_diversity/raw_loo_mean']:.6f}"
+                        f" candidate_diversity/combined_reward_mean="
+                        f"{metrics['candidate_diversity/combined_reward_mean']:.6f}"
+                    )
                 )
                 + ('' if 'kl_mean' not in metrics else f" kl_mean={metrics['kl_mean']:.6f}"),
             )

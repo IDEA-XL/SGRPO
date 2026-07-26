@@ -11,8 +11,10 @@ from genmol.rl.cpgrpo import (
 )
 from genmol.rl.reward import (
     apply_reward_gate,
+    combine_candidate_diversity_reward,
     compute_internal_diversity,
     compute_internal_diversity_loo_credits,
+    compute_internal_diversity_with_loo_credits,
     compute_soft_reward,
     sa_to_score,
 )
@@ -41,10 +43,102 @@ class CpGrpoCoreTest(unittest.TestCase):
             reduced = smiles[:remove_idx] + smiles[remove_idx + 1:]
             expected.append(full_diversity - compute_internal_diversity(reduced))
 
-        actual = compute_internal_diversity_loo_credits(smiles)
+        combined_diversity, actual = (
+            compute_internal_diversity_with_loo_credits(smiles)
+        )
+        self.assertAlmostEqual(combined_diversity, full_diversity)
+        self.assertEqual(
+            compute_internal_diversity_loo_credits(smiles),
+            actual,
+        )
         self.assertEqual(len(actual), len(smiles))
         for left, right in zip(actual, expected):
             self.assertAlmostEqual(left, right)
+
+    def test_internal_diversity_loo_credits_match_raw_formula(self):
+        smiles = ['CCO', 'CCN', 'CCC', 'c1ccccc1']
+        full_diversity, credits = (
+            compute_internal_diversity_with_loo_credits(smiles)
+        )
+        for index, credit in enumerate(credits):
+            pair_distances = []
+            for other_index, other_smiles in enumerate(smiles):
+                if index == other_index:
+                    continue
+                pair_diversity = compute_internal_diversity(
+                    [smiles[index], other_smiles]
+                )
+                pair_distances.append(pair_diversity)
+            mean_distance = sum(pair_distances) / len(pair_distances)
+            expected = (
+                2.0
+                / (len(smiles) - 2)
+                * (mean_distance - full_diversity)
+            )
+            self.assertAlmostEqual(credit, expected)
+        self.assertAlmostEqual(sum(credits), 0.0)
+
+    def test_internal_diversity_loo_handles_validity_boundaries(self):
+        two_valid_diversity, two_valid_credits = (
+            compute_internal_diversity_with_loo_credits(
+                ['CCO', None, 'CCN']
+            )
+        )
+        self.assertGreater(two_valid_diversity, 0.0)
+        self.assertAlmostEqual(
+            two_valid_credits[0],
+            two_valid_diversity,
+        )
+        self.assertEqual(two_valid_credits[1], 0.0)
+        self.assertAlmostEqual(
+            two_valid_credits[2],
+            two_valid_diversity,
+        )
+
+        one_valid_diversity, one_valid_credits = (
+            compute_internal_diversity_with_loo_credits(
+                ['CCO', None, 'not-a-smiles']
+            )
+        )
+        self.assertEqual(one_valid_diversity, 0.0)
+        self.assertEqual(one_valid_credits, [0.0, 0.0, 0.0])
+
+    def test_candidate_diversity_reward_uses_raw_loo_and_shared_gate(self):
+        expected = 0.1 * 0.8 + 0.9 * -0.01
+        reward = combine_candidate_diversity_reward(
+            0.8,
+            -0.01,
+            weight=0.9,
+            is_valid=True,
+            alert_hit=False,
+        )
+        self.assertAlmostEqual(reward, expected)
+        alert_reward = combine_candidate_diversity_reward(
+            0.8,
+            -0.01,
+            weight=0.9,
+            is_valid=True,
+            alert_hit=True,
+        )
+        self.assertAlmostEqual(alert_reward, 0.2 * expected)
+        invalid_reward = combine_candidate_diversity_reward(
+            None,
+            0.0,
+            weight=0.9,
+            is_valid=False,
+            alert_hit=False,
+        )
+        self.assertEqual(invalid_reward, -1.0)
+
+    def test_candidate_diversity_reward_rejects_invalid_weight(self):
+        with self.assertRaisesRegex(ValueError, r'must be in \[0, 1\]'):
+            combine_candidate_diversity_reward(
+                0.8,
+                0.0,
+                weight=1.1,
+                is_valid=True,
+                alert_hit=False,
+            )
 
     def test_split_tensor_dict(self):
         payload = {

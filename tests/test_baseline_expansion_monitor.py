@@ -86,6 +86,29 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
 
         self.assertEqual(result['max_step'], 1)
 
+    def test_dmb_averaged_fractional_counts_are_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            _write_metrics(
+                metrics_path,
+                [
+                    {
+                        'step': 1,
+                        'reward_mean': 0.5,
+                        'grad_norm': 0.25,
+                        'diverse_minibatch/candidate_count': 384.0,
+                        'diverse_minibatch/valid_candidate_count': 383.75,
+                        'diverse_minibatch/selected_count': 192.0,
+                        'diverse_minibatch/target_optimization_count': 192.0,
+                        'diverse_minibatch/shortfall_count': 0.0,
+                    }
+                ],
+            )
+
+            result = monitor._read_metrics(self._dmb_spec(metrics_path))
+
+        self.assertEqual(result['max_step'], 1)
+
     def test_dmb_inconsistent_shortfall_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'

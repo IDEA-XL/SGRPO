@@ -337,49 +337,54 @@ def _read_metrics(spec: JobSpec) -> dict:
                 "diverse_minibatch/shortfall_count",
                 context=context,
             )
-            if candidate_count != spec.expected_candidate_count:
+            if not math.isclose(
+                candidate_count,
+                float(spec.expected_candidate_count),
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-4,
+            ):
                 raise RuntimeError(
                     f"{context} candidate_count={candidate_count}, expected "
                     f"{spec.expected_candidate_count}"
                 )
-            if target_count != spec.expected_selected_count:
+            if not math.isclose(
+                target_count,
+                float(spec.expected_selected_count),
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-4,
+            ):
                 raise RuntimeError(
                     f"{context} target_count={target_count}, expected "
                     f"{spec.expected_selected_count}"
                 )
-            counts = {
-                "candidate_count": candidate_count,
-                "valid_candidate_count": valid_candidate_count,
-                "selected_count": selected_count,
-                "target_count": target_count,
-                "shortfall_count": shortfall_count,
-            }
-            non_integer = {
-                name: value for name, value in counts.items()
-                if not value.is_integer()
-            }
-            if non_integer:
-                raise RuntimeError(
-                    f"{context} has non-integer selection counts: {non_integer}"
-                )
-            if not 0.0 < valid_candidate_count <= candidate_count:
+            if (
+                valid_candidate_count <= 0.0
+                or valid_candidate_count > candidate_count + 1.0e-4
+            ):
                 raise RuntimeError(
                     f"{context} has invalid valid_candidate_count="
                     f"{valid_candidate_count} for candidate_count={candidate_count}"
                 )
-            if not 0.0 < selected_count <= min(
-                valid_candidate_count,
-                target_count,
+            if (
+                selected_count <= 0.0
+                or selected_count
+                > min(valid_candidate_count, target_count) + 1.0e-4
             ):
                 raise RuntimeError(
                     f"{context} has invalid selected_count={selected_count} for "
                     f"valid_candidate_count={valid_candidate_count} and "
                     f"target_count={target_count}"
                 )
-            if shortfall_count != target_count - selected_count:
+            expected_shortfall = target_count - selected_count
+            if not math.isclose(
+                shortfall_count,
+                expected_shortfall,
+                rel_tol=1.0e-6,
+                abs_tol=1.0e-4,
+            ):
                 raise RuntimeError(
                     f"{context} has inconsistent shortfall_count={shortfall_count}; "
-                    f"expected {target_count - selected_count}"
+                    f"expected {expected_shortfall}"
                 )
         else:
             raise RuntimeError(f"Unknown method {spec.method!r}")

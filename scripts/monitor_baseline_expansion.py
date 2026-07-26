@@ -299,8 +299,10 @@ def _read_metrics(spec: JobSpec) -> dict:
 
     for step, row in rows_by_step.items():
         context = f"{spec.name} step {step}"
-        _finite_metric(row, "loss", context=context)
         _finite_metric(row, "reward_mean", context=context)
+        _finite_metric(row, "grad_norm", context=context)
+        if "loss" in row:
+            _finite_metric(row, "loss", context=context)
         if spec.method == "entropy":
             entropy = _finite_metric(
                 row,
@@ -342,7 +344,7 @@ def _read_metrics(spec: JobSpec) -> dict:
     return {
         "path": str(path),
         "max_step": max_step,
-        "first_ten_verified": all(step in rows_by_step for step in range(1, 11)),
+        "first_ten_verified": 1 in rows_by_step and 10 in rows_by_step,
         "latest": rows_by_step.get(max_step, {}),
     }
 

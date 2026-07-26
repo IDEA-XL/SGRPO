@@ -63,6 +63,51 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'non-finite grad_norm'):
                 monitor._read_metrics(self._entropy_spec(metrics_path))
 
+    def test_dmb_valid_candidate_shortfall_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            _write_metrics(
+                metrics_path,
+                [
+                    {
+                        'step': 1,
+                        'reward_mean': 0.5,
+                        'grad_norm': 0.25,
+                        'diverse_minibatch/candidate_count': 384,
+                        'diverse_minibatch/valid_candidate_count': 182,
+                        'diverse_minibatch/selected_count': 182,
+                        'diverse_minibatch/target_optimization_count': 192,
+                        'diverse_minibatch/shortfall_count': 10,
+                    }
+                ],
+            )
+
+            result = monitor._read_metrics(self._dmb_spec(metrics_path))
+
+        self.assertEqual(result['max_step'], 1)
+
+    def test_dmb_inconsistent_shortfall_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            _write_metrics(
+                metrics_path,
+                [
+                    {
+                        'step': 1,
+                        'reward_mean': 0.5,
+                        'grad_norm': 0.25,
+                        'diverse_minibatch/candidate_count': 384,
+                        'diverse_minibatch/valid_candidate_count': 182,
+                        'diverse_minibatch/selected_count': 182,
+                        'diverse_minibatch/target_optimization_count': 192,
+                        'diverse_minibatch/shortfall_count': 0,
+                    }
+                ],
+            )
+
+            with self.assertRaisesRegex(RuntimeError, 'inconsistent shortfall_count'):
+                monitor._read_metrics(self._dmb_spec(metrics_path))
+
     @staticmethod
     def _entropy_spec(metrics_path):
         return monitor.JobSpec(
@@ -71,6 +116,18 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             metrics_glob=str(metrics_path),
             method='entropy',
             expected_final_step=2000,
+        )
+
+    @staticmethod
+    def _dmb_spec(metrics_path):
+        return monitor.JobSpec(
+            name='progen2_dmb',
+            job_id=1,
+            metrics_glob=str(metrics_path),
+            method='dmb',
+            expected_final_step=100,
+            expected_candidate_count=384,
+            expected_selected_count=192,
         )
 
 

@@ -37,6 +37,9 @@ export PYTHONPATH="${REPO_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_PROJECT="${WANDB_PROJECT:-SGRPO}"
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=safe.directory
+export GIT_CONFIG_VALUE_0="${REPO_DIR}"
 
 CACHE_TAG="sgrpo_rawloo_4gpu_${UID}_$$"
 export HF_HOME="${HF_HOME:-/tmp/${CACHE_TAG}/huggingface}"
@@ -46,7 +49,8 @@ mkdir -p "${HF_HOME}" "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}"
 
 cd "${REPO_DIR}"
 
-echo "Launching 4-GPU training from commit $(git rev-parse --short HEAD)"
+COMMIT="$(git rev-parse --short HEAD)"
+echo "Launching 4-GPU training from commit ${COMMIT}"
 echo "Config: ${CONFIG_PATH}"
 echo "Visible GPUs: ${GPU_COUNT}"
 echo "W&B mode: ${WANDB_MODE}"

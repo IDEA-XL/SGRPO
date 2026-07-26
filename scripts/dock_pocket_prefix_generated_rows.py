@@ -65,10 +65,39 @@ def _validate_generated_rows(rows, entry_by_source_index, max_rows):
         source_index = int(row['source_index'])
         if source_index not in entry_by_source_index:
             raise ValueError(f'Generated row {row_idx} source_index not found in manifest split: {source_index}')
-        validated.append(row)
+        validated.append((row_idx, row))
     if not validated:
         raise ValueError('No generated rows remain after validation')
     return validated
+
+
+def _select_pocket_shard(indexed_rows, num_shards, shard_index):
+    if num_shards <= 0:
+        raise ValueError('num_shards must be positive')
+    if shard_index < 0 or shard_index >= num_shards:
+        raise ValueError(
+            f'shard_index must be in [0, {num_shards}), got {shard_index}'
+        )
+    source_indices = sorted({int(row['source_index']) for _, row in indexed_rows})
+    if num_shards > len(source_indices):
+        raise ValueError(
+            f'num_shards exceeds the number of pockets: {num_shards} vs {len(source_indices)}'
+        )
+    selected_source_indices = {
+        source_index
+        for source_rank, source_index in enumerate(source_indices)
+        if source_rank % num_shards == shard_index
+    }
+    selected_rows = [
+        (row_idx, row)
+        for row_idx, row in indexed_rows
+        if int(row['source_index']) in selected_source_indices
+    ]
+    if not selected_rows:
+        raise ValueError(
+            f'Pocket shard {shard_index}/{num_shards} selected no generated rows'
+        )
+    return selected_rows, sorted(selected_source_indices), source_indices
 
 
 def _build_evaluator(args, mode):
@@ -169,6 +198,8 @@ def parse_args():
     parser.add_argument('--output_summary_path', required=True)
     parser.add_argument('--num_workers', type=int, required=True)
     parser.add_argument('--max_rows', type=int, default=None)
+    parser.add_argument('--num_shards', type=int, default=1)
+    parser.add_argument('--shard_index', type=int, default=0)
     parser.add_argument('--docking_modes', nargs='+', default=['vina_dock', 'qvina'])
     parser.add_argument('--docking_exhaustiveness', type=int, default=8)
     parser.add_argument('--docking_num_cpu', type=int, default=1)
@@ -202,11 +233,18 @@ def main():
 
     rows = _read_jsonl(args.generated_rows_path)
     entry_by_source_index = _load_entry_map(args.manifest_path, args.split)
-    rows = _validate_generated_rows(rows, entry_by_source_index, args.max_rows)
-    _prewarm_receptor_cache(args, rows, entry_by_source_index)
+    indexed_rows = _validate_generated_rows(rows, entry_by_source_index, args.max_rows)
+    global_num_rows = len(indexed_rows)
+    indexed_rows, selected_source_indices, all_source_indices = _select_pocket_shard(
+        indexed_rows,
+        args.num_shards,
+        args.shard_index,
+    )
+    selected_rows = [row for _, row in indexed_rows]
+    _prewarm_receptor_cache(args, selected_rows, entry_by_source_index)
 
     tasks = []
-    for row_idx, row in enumerate(rows):
+    for row_idx, row in indexed_rows:
         for mode in args.docking_modes:
             tasks.append({'task_index': len(tasks), 'row_idx': row_idx, 'mode': mode, 'row': row})
     if not tasks:
@@ -258,14 +296,20 @@ def main():
 
     summary_payload = {
         'generated_rows_path': args.generated_rows_path,
-        'num_rows': len(rows),
+        'global_num_rows': global_num_rows,
+        'num_rows': len(indexed_rows),
+        'num_shards': args.num_shards,
+        'shard_index': args.shard_index,
+        'num_pockets': len(selected_source_indices),
+        'global_num_pockets': len(all_source_indices),
+        'selected_source_indices': selected_source_indices,
         'docking_modes': args.docking_modes,
         'num_workers': args.num_workers,
         'docking_num_cpu': args.docking_num_cpu,
         'num_tasks': len(tasks),
         'elapsed_sec': float(elapsed_sec),
         'tasks_per_sec': float(len(tasks) / max(elapsed_sec, 1e-9)),
-        'molecules_per_sec_two_modes_equivalent': float(len(rows) / max(elapsed_sec, 1e-9)),
+        'molecules_per_sec_two_modes_equivalent': float(len(indexed_rows) / max(elapsed_sec, 1e-9)),
         'summaries': summaries,
     }
     _write_json(args.output_summary_path, summary_payload)

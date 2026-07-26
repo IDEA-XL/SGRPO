@@ -116,7 +116,7 @@ JOB_TEMPLATES = {
         "metrics_glob": str(
             RUNS_ROOT
             / "progen2_sgrpo"
-            / "progen2_dmb_grpo_ng192_bs2_len256_rbs16_ms100_slurm{job_id}"
+            / "progen2_dmb_grpo_ng192_bs2_len256_rbs16_ms100_*"
             / "metrics.jsonl"
         ),
         "method": "dmb",
@@ -128,7 +128,7 @@ JOB_TEMPLATES = {
         "metrics_glob": str(
             RUNS_ROOT
             / "progen2_sgrpo"
-            / "progen2_entropy001_grpo_ng96_bs2_len256_rbs16_ms100_slurm{job_id}"
+            / "progen2_entropy001_grpo_ng96_bs2_len256_rbs16_ms100_*"
             / "metrics.jsonl"
         ),
         "method": "entropy",
@@ -358,7 +358,7 @@ def _read_metrics(spec: JobSpec) -> dict:
                     f"{spec.expected_selected_count}"
                 )
             if (
-                valid_candidate_count <= 0.0
+                valid_candidate_count < 0.0
                 or valid_candidate_count > candidate_count + 1.0e-4
             ):
                 raise RuntimeError(
@@ -366,7 +366,7 @@ def _read_metrics(spec: JobSpec) -> dict:
                     f"{valid_candidate_count} for candidate_count={candidate_count}"
                 )
             if (
-                selected_count <= 0.0
+                selected_count < 0.0
                 or selected_count
                 > min(valid_candidate_count, target_count) + 1.0e-4
             ):

@@ -200,12 +200,8 @@ def select_sequence_groups(
         ]
         valid_count += len(group_valid_indices)
         if not group_valid_indices:
-            raise RuntimeError(
-                'Diverse Mini-Batch GRPO found no valid protein candidate in '
-                f'group {group_idx}; refusing to fabricate an optimization sample'
-            )
-
-        if len(group_valid_indices) <= selected_size:
+            group_picks = []
+        elif len(group_valid_indices) <= selected_size:
             group_picks = list(range(len(group_valid_indices)))
         else:
             valid_sequences = [
@@ -224,6 +220,7 @@ def select_sequence_groups(
         padded_picks, group_mask = _pad_group_selection(
             original_group_picks,
             selected_size=selected_size,
+            empty_fallback_index=0,
         )
         group_offset = group_idx * candidate_size
         selected_indices.extend(group_offset + idx for idx in padded_picks)
@@ -381,9 +378,21 @@ def _validate_grouped_items(items, group_size):
     ]
 
 
-def _pad_group_selection(indices, *, selected_size):
+def _pad_group_selection(
+    indices,
+    *,
+    selected_size,
+    empty_fallback_index=None,
+):
     if not indices:
-        raise RuntimeError('cannot pad an empty selected group')
+        if empty_fallback_index is None:
+            raise RuntimeError('cannot pad an empty selected group')
+        if int(empty_fallback_index) != empty_fallback_index or empty_fallback_index < 0:
+            raise ValueError(
+                'empty_fallback_index must be a non-negative integer, '
+                f'got {empty_fallback_index!r}'
+            )
+        return [int(empty_fallback_index)] * selected_size, [False] * selected_size
     if len(indices) > selected_size:
         raise ValueError(
             f'selected group exceeds target size: {len(indices)} vs {selected_size}'
@@ -405,9 +414,9 @@ def _selection_metrics(
 ):
     if candidate_count <= 0 or target_count <= 0:
         raise ValueError('candidate_count and target_count must be positive')
-    if not 0 < selected_count <= target_count:
+    if not 0 <= selected_count <= target_count:
         raise ValueError(
-            f'selected_count must be in [1, {target_count}], got {selected_count}'
+            f'selected_count must be in [0, {target_count}], got {selected_count}'
         )
     return {
         'candidate_count': float(candidate_count),

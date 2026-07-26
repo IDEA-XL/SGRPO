@@ -103,11 +103,6 @@ def compute_grouped_advantages(
         num_generations,
     )
     active_counts = mask_grouped.sum(dim=1, keepdim=True)
-    if torch.any(active_counts == 0):
-        empty_groups = torch.nonzero(active_counts.squeeze(1) == 0).view(-1).tolist()
-        raise ValueError(
-            f'every reward group must contain at least one active sample; empty groups={empty_groups}'
-        )
 
     masked_rewards = torch.where(
         mask_grouped,
@@ -124,7 +119,7 @@ def compute_grouped_advantages(
     )
 
     active_counts_float = active_counts.to(dtype=rewards.dtype)
-    means = sum_group / active_counts_float
+    means = sum_group / active_counts_float.clamp(min=1.0)
     squared_deviations = torch.where(
         mask_grouped,
         (rewards_grouped - means).square(),
@@ -150,7 +145,11 @@ def compute_grouped_advantages(
             torch.zeros_like(advantages),
         )
     active_std = repeated_std[sample_mask.to(device=rewards.device, dtype=torch.bool)]
-    zero_std_ratio = (active_std < 1e-6).to(torch.float32).mean().item()
+    zero_std_ratio = (
+        1.0
+        if active_std.numel() == 0
+        else (active_std < 1e-6).to(torch.float32).mean().item()
+    )
     return advantages, repeated_std, zero_std_ratio
 
 

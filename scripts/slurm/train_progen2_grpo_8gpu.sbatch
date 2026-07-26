@@ -109,6 +109,14 @@ if [[ ! -f "${ACCELERATE_CONFIG_PATH}" ]]; then
   echo "Missing Accelerate config: ${ACCELERATE_CONFIG_PATH}" >&2
   exit 1
 fi
+train_args=("${CONFIG_PATH}")
+if [[ -n "${RESUME_FROM_CHECKPOINT:-}" ]]; then
+  if [[ ! -d "${RESUME_FROM_CHECKPOINT}" ]]; then
+    echo "Missing resume checkpoint directory: ${RESUME_FROM_CHECKPOINT}" >&2
+    exit 1
+  fi
+  train_args+=(--resume_from_checkpoint "${RESUME_FROM_CHECKPOINT}")
+fi
 
 python - <<'PY'
 import importlib
@@ -127,4 +135,4 @@ accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MASTER_PORT}" \
   scripts/train_progen2_sgrpo.py \
-  "${CONFIG_PATH}"
+  "${train_args[@]}"

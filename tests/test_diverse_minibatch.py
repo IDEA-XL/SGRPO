@@ -9,6 +9,7 @@ from rl_shared.diverse_minibatch import (
     select_sequence_groups,
 )
 from rl_shared.sgrpo import compute_grouped_advantages
+from rl_shared.sgrpo import compute_clipped_grpo_loss
 
 
 class DiverseMiniBatchTest(unittest.TestCase):
@@ -92,6 +93,19 @@ class DiverseMiniBatchTest(unittest.TestCase):
         self.assertEqual(len(selection.indices), 3)
         self.assertEqual(selection.metrics['shortfall_count'], 1.0)
 
+    def test_sequence_empty_group_preserves_shape_and_masks_all_padding(self):
+        selection = select_sequence_groups(
+            ['', 'AX', None, ''],
+            candidate_size=4,
+            selected_size=3,
+            seed=5,
+        )
+        self.assertEqual(selection.indices, (0, 0, 0))
+        self.assertEqual(selection.active_mask, (False, False, False))
+        self.assertEqual(selection.metrics['valid_candidate_count'], 0.0)
+        self.assertEqual(selection.metrics['selected_count'], 0.0)
+        self.assertEqual(selection.metrics['shortfall_count'], 3.0)
+
     def test_masked_grouped_advantages_ignore_padding(self):
         rewards = torch.tensor([1.0, 2.0, 100.0, 4.0])
         mask = torch.tensor([True, True, False, True])
@@ -108,6 +122,56 @@ class DiverseMiniBatchTest(unittest.TestCase):
         )
         self.assertEqual(repeated_std[2].item(), 0.0)
         self.assertAlmostEqual(zero_std_ratio, 1.0 / 3.0)
+
+    def test_masked_grouped_advantages_accept_empty_group(self):
+        rewards = torch.tensor([7.0, 9.0, 1.0, 3.0])
+        mask = torch.tensor([False, False, True, True])
+        advantages, repeated_std, zero_std_ratio = compute_grouped_advantages(
+            rewards,
+            num_generations=2,
+            sample_mask=mask,
+        )
+        self.assertTrue(
+            torch.allclose(
+                advantages,
+                torch.tensor([0.0, 0.0, -2.0, 2.0]),
+            )
+        )
+        self.assertTrue(
+            torch.allclose(
+                repeated_std,
+                torch.tensor([0.0, 0.0, 2.0 ** 0.5, 2.0 ** 0.5]),
+            )
+        )
+        self.assertEqual(zero_std_ratio, 0.0)
+
+    def test_masked_grouped_advantages_accept_all_inactive(self):
+        rewards = torch.tensor([7.0, 9.0])
+        mask = torch.tensor([False, False])
+        advantages, repeated_std, zero_std_ratio = compute_grouped_advantages(
+            rewards,
+            num_generations=2,
+            sample_mask=mask,
+        )
+        self.assertTrue(torch.equal(advantages, torch.zeros_like(rewards)))
+        self.assertTrue(torch.equal(repeated_std, torch.zeros_like(rewards)))
+        self.assertEqual(zero_std_ratio, 1.0)
+
+    def test_zero_active_completion_loss_remains_backwardable(self):
+        new_log_probs = torch.zeros(2, 1, 4, requires_grad=True)
+        old_log_probs = torch.zeros_like(new_log_probs)
+        completion_mask = torch.zeros(2, 4, dtype=torch.bool)
+        loss, metrics = compute_clipped_grpo_loss(
+            new_log_probs=new_log_probs,
+            old_log_probs=old_log_probs,
+            advantages=torch.zeros(2),
+            completion_mask=completion_mask,
+            epsilon=0.2,
+        )
+        self.assertEqual(loss.item(), 0.0)
+        self.assertEqual(metrics['ratio_mean'].item(), 0.0)
+        loss.backward()
+        self.assertTrue(torch.equal(new_log_probs.grad, torch.zeros_like(new_log_probs)))
 
     def test_coupled_entropy_uses_same_states_without_an_extra_forward(self):
         logits = torch.zeros(3, 2, 4, requires_grad=True)

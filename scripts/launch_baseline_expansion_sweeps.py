@@ -79,26 +79,27 @@ def _resolve_molecule_checkpoint(
 def _resolve_progen2_checkpoint(
     *,
     config_stem: str,
-    job_id: int,
     checkpoint_step: int,
 ) -> Path:
-    checkpoint = (
-        RUNS_ROOT
-        / "progen2_sgrpo"
-        / f"{config_stem}_slurm{job_id}"
-        / f"checkpoint-{checkpoint_step:06d}"
+    relative_checkpoint = Path(f"checkpoint-{checkpoint_step:06d}")
+    candidates = sorted(
+        run_dir / relative_checkpoint
+        for run_dir in (RUNS_ROOT / "progen2_sgrpo").glob(f"{config_stem}_*")
     )
-    required = (
-        checkpoint / "trainer_state.pt",
-        checkpoint / "model.safetensors",
-        checkpoint / "config.json",
-    )
-    missing = [path for path in required if not path.exists()]
-    if missing:
-        raise FileNotFoundError(
-            f"Incomplete ProGen2 checkpoint {checkpoint}; missing {missing}"
+    complete = [
+        checkpoint
+        for checkpoint in candidates
+        if all(
+            (checkpoint / name).is_file()
+            for name in ("trainer_state.pt", "model.safetensors", "config.json")
         )
-    return checkpoint
+    ]
+    if len(complete) != 1:
+        raise RuntimeError(
+            f"Expected exactly one completed checkpoint for {config_stem}, "
+            f"found {len(complete)}: {complete}"
+        )
+    return complete[0]
 
 
 def _require_completed_jobs(job_ids: dict[str, int]) -> None:
@@ -181,12 +182,10 @@ def main() -> None:
         ),
         "progen2_dmb": _resolve_progen2_checkpoint(
             config_stem=PROGEN2_DMB_CONFIG,
-            job_id=args.progen2_dmb_job_id,
             checkpoint_step=100,
         ),
         "progen2_entropy": _resolve_progen2_checkpoint(
             config_stem=PROGEN2_ENTROPY_CONFIG,
-            job_id=args.progen2_entropy_job_id,
             checkpoint_step=100,
         ),
     }

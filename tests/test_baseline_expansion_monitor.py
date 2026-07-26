@@ -109,6 +109,29 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
 
         self.assertEqual(result['max_step'], 1)
 
+    def test_dmb_zero_valid_candidates_are_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            _write_metrics(
+                metrics_path,
+                [
+                    {
+                        'step': 39,
+                        'reward_mean': 0.0,
+                        'grad_norm': 0.0,
+                        'diverse_minibatch/candidate_count': 384,
+                        'diverse_minibatch/valid_candidate_count': 0,
+                        'diverse_minibatch/selected_count': 0,
+                        'diverse_minibatch/target_optimization_count': 192,
+                        'diverse_minibatch/shortfall_count': 192,
+                    }
+                ],
+            )
+
+            result = monitor._read_metrics(self._dmb_spec(metrics_path))
+
+        self.assertEqual(result['max_step'], 39)
+
     def test_dmb_inconsistent_shortfall_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'

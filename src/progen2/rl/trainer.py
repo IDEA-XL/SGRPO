@@ -57,6 +57,14 @@ logger = logging.getLogger(__name__)
 _CHECKPOINT_PATTERN = re.compile(r'^checkpoint-(\d+)$')
 
 
+def _tensor_mean_or_zero(values):
+    if not torch.is_tensor(values):
+        raise TypeError(f'values must be a tensor, got {type(values).__name__}')
+    if values.numel() == 0:
+        return 0.0
+    return float(values.mean().item())
+
+
 def default_reward_compute_every_n_steps():
     return normalize_reward_compute_every_n_steps(None)
 
@@ -973,8 +981,6 @@ class ProGen2SGRPOTrainer:
                 raise ValueError('active_mask must match the sequence batch')
             active_flags = active_mask.to(dtype=torch.bool).tolist()
         active_count = sum(active_flags)
-        if active_count == 0:
-            raise RuntimeError('reward scoring requires at least one active sequence')
         valid_indices = [
             idx for idx, sequence in enumerate(sequences)
             if active_flags[idx] and is_valid_protein_sequence(sequence)
@@ -984,9 +990,11 @@ class ProGen2SGRPOTrainer:
             reward_name: [0.0] * len(sequences) for reward_name in REWARD_NAME_ORDER
         }
         metrics = {
-            'invalid_sequence_rate': 1.0 - (
-                len(valid_indices) / active_count
-            )
+            'invalid_sequence_rate': (
+                0.0
+                if active_count == 0
+                else 1.0 - (len(valid_indices) / active_count)
+            ),
         }
         if valid_indices:
             valid_sequences = [sequences[idx] for idx in valid_indices]
@@ -1451,7 +1459,7 @@ class ProGen2SGRPOTrainer:
         active_rollout_advantages = rollout_advantages[active_mask]
         metrics = {
             'loss': float(loss.detach().item()),
-            'reward_mean': float(active_rollout_rewards.mean().item()),
+            'reward_mean': _tensor_mean_or_zero(active_rollout_rewards),
             'group_reward_mean': float(
                 advantage_metrics.get('group_reward_mean', group_rewards.mean().item())
             ),
@@ -1464,9 +1472,13 @@ class ProGen2SGRPOTrainer:
             'group_reward_indicator_mean': float(
                 advantage_metrics.get('group_reward_indicator_mean', 1.0)
             ),
-            'advantage_mean': float(active_advantages.mean().item()),
-            'group_advantage_mean': float(active_group_advantages.mean().item()),
-            'rollout_advantage_mean': float(active_rollout_advantages.mean().item()),
+            'advantage_mean': _tensor_mean_or_zero(active_advantages),
+            'group_advantage_mean': _tensor_mean_or_zero(
+                active_group_advantages
+            ),
+            'rollout_advantage_mean': _tensor_mean_or_zero(
+                active_rollout_advantages
+            ),
             **{key: float(value) for key, value in reward_metrics.items()},
             **selection_metrics,
             **{f'hbd/{key}': float(value) for key, value in hbd_metrics.items()},

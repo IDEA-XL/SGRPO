@@ -37,6 +37,7 @@ DOCKING_CACHE_DIR = Path(
 DOCKING_SHARDS = 10
 ROWS_PER_POINT = 10000
 ROWS_PER_SHARD = 1000
+GENERATION_BUNDLE_SIZE = 2
 
 
 def _read_tasks(path: Path) -> list[dict[str, str]]:
@@ -75,8 +76,8 @@ def _build_dag():
                 script=REPO_REMOTE_ROOT
                 / 'scripts/slurm/rebuttal_mmgenmol_100x_generate_1gpu.sbatch',
                 job_name=f'm100g{seed}',
-                output_pattern=LOG_ROOT / f'generation_seed{seed}_%A_%a.out',
-                error_pattern=LOG_ROOT / f'generation_seed{seed}_%A_%a.err',
+                output_pattern=LOG_ROOT / f'generation_seed{seed}_%j.out',
+                error_pattern=LOG_ROOT / f'generation_seed{seed}_%j.err',
                 time_limit='01:00:00',
                 exports=(('TASKS_PATH', str(tasks_path)), ('SEED', str(seed))),
             ),
@@ -254,6 +255,103 @@ def _preflight() -> None:
         )
 
 
+def _submit_generation_bundle(
+    state: dict,
+    group: engine.GroupSpec,
+    bundle: list[engine.TaskSpec],
+) -> bool:
+    if not bundle or len(bundle) > GENERATION_BUNDLE_SIZE:
+        raise ValueError(f'Invalid generation bundle size: {len(bundle)}')
+    if any(task.array_id is None for task in bundle):
+        raise ValueError('Generation bundle tasks must have point IDs')
+    task_ids = ':'.join(str(task.array_id) for task in bundle)
+    exports = (*group.exports, ('TASK_IDS', task_ids))
+    command = [
+        str(engine.SBATCH),
+        '--parsable',
+        '--exclude=server13',
+        f'--job-name={group.job_name}',
+        f'--output={group.output_pattern}',
+        f'--error={group.error_pattern}',
+        f'--time={group.time_limit}',
+        f'--export={engine._export_option(exports)}',
+        str(group.script),
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        env=engine._clean_submission_environment(),
+    )
+    if result.returncode != 0:
+        combined = f'{result.stdout}\n{result.stderr}'
+        if 'QOSMaxSubmitJobPerUserLimit' in combined:
+            print(
+                f'GPU submit slots changed concurrently; retrying later: {combined.strip()}',
+                flush=True,
+            )
+            return False
+        raise RuntimeError(
+            f'sbatch failed for {group.name}: returncode={result.returncode}\n{combined}'
+        )
+    job_id = result.stdout.strip().split(';', 1)[0]
+    if not job_id.isdigit():
+        raise RuntimeError(f'Could not parse job ID for {group.name}: {result.stdout!r}')
+    submitted_at = time.time()
+    for task in bundle:
+        state['tasks'][task.key] = {
+            'status': 'submitted',
+            'job_id': job_id,
+            'array_id': None,
+            'submitted_at_epoch': submitted_at,
+        }
+    state['submissions'].append(
+        {
+            'group': group.name,
+            'job_id': job_id,
+            'task_keys': [task.key for task in bundle],
+            'command': command,
+            'submitted_at_epoch': submitted_at,
+        }
+    )
+    engine._atomic_write_state(state)
+    print(
+        f'submitted generation_bundle group={group.name} job={job_id} '
+        f'task_ids={task_ids}',
+        flush=True,
+    )
+    return True
+
+
+def _schedule_generation_bundles(
+    state: dict,
+    groups: dict[str, engine.GroupSpec],
+    ready: dict[str, list[engine.TaskSpec]],
+    gpu_submitted_count: int,
+) -> None:
+    capacity = max(0, engine.GPU_MAX_SUBMITTED_JOBS - gpu_submitted_count)
+    queues = {
+        group_name: list(ready.get(group_name, ()))
+        for group_name, group in groups.items()
+        if group.resource == 'gpu' and ready.get(group_name)
+    }
+    while capacity > 0 and queues:
+        progressed = False
+        for group_name in list(queues):
+            bundle = queues[group_name][:GENERATION_BUNDLE_SIZE]
+            if not _submit_generation_bundle(state, groups[group_name], bundle):
+                return
+            del queues[group_name][:len(bundle)]
+            if not queues[group_name]:
+                del queues[group_name]
+            capacity -= 1
+            progressed = True
+            if capacity == 0:
+                break
+        if not progressed:
+            break
+
+
 def main() -> None:
     _preflight()
     LOG_ROOT.mkdir(parents=True, exist_ok=True)
@@ -301,7 +399,7 @@ def main() -> None:
             engine._schedule_cpu_tasks(state, groups, ready)
             active_jobs, gpu_submitted_count = engine._active_jobs()
             ready = engine._ready_tasks(state, tasks)
-            engine._schedule_gpu_tasks(
+            _schedule_generation_bundles(
                 state,
                 groups,
                 ready,

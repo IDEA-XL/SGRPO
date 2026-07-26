@@ -271,6 +271,9 @@ def resolve_output_dir(config, config_path):
         base_dir = os.path.join(repo_root, 'runs', 'cpgrpo_denovo')
 
     config_name = os.path.splitext(os.path.basename(config_path))[0]
+    slurm_job_id = os.environ.get('SLURM_JOB_ID')
+    if slurm_job_id:
+        return os.path.join(base_dir, f'{config_name}_slurm{slurm_job_id}')
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     return os.path.join(base_dir, f'{config_name}_{timestamp}')
 

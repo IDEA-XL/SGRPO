@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=2G
-#SBATCH -t 7-00:00:00
+#SBATCH -t 5-00:00:00
 #SBATCH -J mm100ctl
 
 set -euo pipefail

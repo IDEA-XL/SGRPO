@@ -5,6 +5,7 @@ import os
 import random
 import re
 import shutil
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
@@ -764,6 +765,22 @@ class ProGen2SGRPOTrainer:
             + 991
         )
 
+    def _calibration_seed(self, attempt, accumulation_index):
+        attempt = int(attempt)
+        if attempt < 0:
+            raise ValueError(f'calibration attempt must be non-negative, got {attempt}')
+        return (
+            self.config.seed
+            + attempt * self.effective_world_size
+            + self._virtual_process_index(accumulation_index)
+        )
+
+    def _calibration_prompt_cursor(self, accumulation_index):
+        return (
+            self._virtual_process_index(accumulation_index)
+            * self.config.reward_calibration_prompt_batch_size
+        ) % len(self.prompts)
+
     def _next_prompt_batch(self, accumulation_index=0):
         index = self._validate_accumulation_index(accumulation_index)
         expected_cursor = self._prompt_cursor_after_steps(self.global_step)
@@ -797,19 +814,33 @@ class ProGen2SGRPOTrainer:
     def _calibration_sequences(self):
         target = int(self.config.reward_calibration_size)
         per_device_prompt_batch_size = int(self.config.reward_calibration_prompt_batch_size)
-        world_size = self.accelerator.num_processes
-        calibration_cursor = self.accelerator.process_index * per_device_prompt_batch_size
+        calibration_cursors = [
+            self._calibration_prompt_cursor(accumulation_index)
+            for accumulation_index in range(
+                self.config.gradient_accumulation_steps
+            )
+        ]
         collected = [] if self.accelerator.is_main_process else None
         attempts = 0
         max_batches = max(
             8,
-            math.ceil(target / max(1, per_device_prompt_batch_size * world_size)) * 20,
+            math.ceil(
+                target
+                / max(
+                    1,
+                    per_device_prompt_batch_size * self.effective_world_size,
+                )
+            )
+            * 20,
         )
         logger.info(
-            'Starting reward calibration: target_sequences=%d per_device_prompt_batch_size=%d world_size=%d',
+            'Starting reward calibration: target_sequences=%d '
+            'per_device_prompt_batch_size=%d physical_world_size=%d '
+            'effective_world_size=%d',
             target,
             per_device_prompt_batch_size,
-            world_size,
+            self.accelerator.num_processes,
+            self.effective_world_size,
         )
         while True:
             batch_sizes = None
@@ -824,24 +855,45 @@ class ProGen2SGRPOTrainer:
                 batch_sizes = _distributed_calibration_batch_sizes(
                     remaining,
                     per_device_prompt_batch_size,
-                    world_size,
+                    self.effective_world_size,
                 )
             batch_sizes = self._broadcast_object(batch_sizes)
-            local_batch_size = int(batch_sizes[self.accelerator.process_index])
+            local_batch_sizes = [
+                int(batch_sizes[self._virtual_process_index(accumulation_index)])
+                for accumulation_index in range(
+                    self.config.gradient_accumulation_steps
+                )
+            ]
             total_batch_size = sum(batch_sizes)
             if total_batch_size == 0:
                 break
-            if local_batch_size > 0:
-                prompts = _cycle_prompt_batch(self.prompts, local_batch_size, calibration_cursor)
-                rollout = self._generate_rollouts(
-                    prompts,
-                    num_return_sequences=1,
-                    seed=self.config.seed + attempts * world_size + self.accelerator.process_index,
-                )
-                valid = [sequence for sequence in rollout.protein_sequences if sequence]
-            else:
-                valid = []
-            calibration_cursor = (calibration_cursor + total_batch_size) % len(self.prompts)
+            valid = []
+            for accumulation_index, local_batch_size in enumerate(
+                local_batch_sizes
+            ):
+                if local_batch_size > 0:
+                    prompts = _cycle_prompt_batch(
+                        self.prompts,
+                        local_batch_size,
+                        calibration_cursors[accumulation_index],
+                    )
+                    rollout = self._generate_rollouts(
+                        prompts,
+                        num_return_sequences=1,
+                        seed=self._calibration_seed(
+                            attempts,
+                            accumulation_index,
+                        ),
+                    )
+                    valid.extend(
+                        sequence
+                        for sequence in rollout.protein_sequences
+                        if sequence
+                    )
+                calibration_cursors[accumulation_index] = (
+                    calibration_cursors[accumulation_index]
+                    + total_batch_size
+                ) % len(self.prompts)
             gathered = self._all_gather_object(valid)
             if self.accelerator.is_main_process:
                 for sequences in gathered:
@@ -1515,17 +1567,26 @@ class ProGen2SGRPOTrainer:
             for accumulation_index in range(
                 self.config.gradient_accumulation_steps
             ):
-                micro_batch_result = self._run_training_micro_batch(
+                is_last_micro_batch = (
                     accumulation_index
+                    == self.config.gradient_accumulation_steps - 1
                 )
-                loss = micro_batch_result.pop('loss')
-                # Accelerate scales each backward call by gradient_accumulation_steps.
-                self.accelerator.backward(loss)
-                del loss
+                sync_context = (
+                    nullcontext()
+                    if is_last_micro_batch
+                    else self.accelerator.no_sync(self.policy.model.model)
+                )
+                with sync_context:
+                    micro_batch_result = self._run_training_micro_batch(
+                        accumulation_index
+                    )
+                    loss = micro_batch_result.pop('loss')
+                    # Accelerate scales each backward call by accumulation steps.
+                    self.accelerator.backward(loss)
+                    del loss
                 if (
                     self.device.type == 'cuda'
-                    and accumulation_index
-                    < self.config.gradient_accumulation_steps - 1
+                    and not is_last_micro_batch
                 ):
                     self._finish_cuda_training_phase(micro_batch_result)
                 micro_batch_results.append(micro_batch_result)

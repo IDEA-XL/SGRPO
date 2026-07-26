@@ -196,6 +196,7 @@ def test_unidock_prepare_rejects_zero_heavy_atom_smiles(tmp_path):
 def test_classify_unidock_failure_matches_known_ligand_error_markers():
     assert _classify_unidock_failure('Structure parsing error: No atoms in this ligand.', '') == 'no_atoms'
     assert _classify_unidock_failure('', 'An internal error occurred in model.cpp(1101)') == 'bond_length_assertion'
+    assert _classify_unidock_failure('', 'Ligand foo.sdf exceed max atom counts. 154') == 'max_atom_count'
     assert _classify_unidock_failure('random stdout', 'random stderr') is None
 
 

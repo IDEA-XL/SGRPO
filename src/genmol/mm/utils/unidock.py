@@ -55,6 +55,7 @@ _HYDROGEN_ATOMIC_NUMBER = 1
 _UNIDOCK_LIGAND_FAILURE_MARKERS = {
     'no_atoms': 'No atoms in this ligand.',
     'bond_length_assertion': 'model.cpp(1101)',
+    'max_atom_count': 'exceed max atom counts.',
 }
 
 

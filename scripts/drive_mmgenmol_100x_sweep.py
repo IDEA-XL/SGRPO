@@ -77,7 +77,7 @@ def _build_dag():
                 job_name=f'm100g{seed}',
                 output_pattern=LOG_ROOT / f'generation_seed{seed}_%A_%a.out',
                 error_pattern=LOG_ROOT / f'generation_seed{seed}_%A_%a.err',
-                time_limit='02:00:00',
+                time_limit='01:00:00',
                 exports=(('TASKS_PATH', str(tasks_path)), ('SEED', str(seed))),
             ),
         )

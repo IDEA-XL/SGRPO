@@ -37,6 +37,7 @@ COMPLETE_PATH = RUN_OUTPUT_ROOT / "COMPLETE"
 GPU_MAX_SUBMITTED_JOBS = 40
 GPU_TASKS_PER_GROUP_PER_ROUND = 4
 POLL_SECONDS = 60
+COMPLETED_OUTPUT_GRACE_SECONDS = 180
 DOMAIN_ENV = "REBUTTAL_DOMAINS"
 SUPPORTED_DOMAINS = ("denovo", "mmgenmol", "progen2")
 
@@ -777,8 +778,20 @@ def _refresh_task_states(
             continue
         state_name, exit_code = job_state
         if state_name == "COMPLETED":
+            grace_started_at = entry.get("output_validation_grace_started_at_epoch")
+            if grace_started_at is None:
+                entry["output_validation_grace_started_at_epoch"] = now
+                print(
+                    f"waiting for completed job output: task={key} job={job_key}",
+                    flush=True,
+                )
+                continue
+            grace_elapsed = now - float(grace_started_at)
+            if grace_elapsed < COMPLETED_OUTPUT_GRACE_SECONDS:
+                continue
             raise RuntimeError(
-                f"Job completed but expected output validation failed: {key} {job_key}"
+                "Job completed but expected output validation failed after "
+                f"{grace_elapsed:.0f}s grace: {key} {job_key}"
             )
         if state_name in terminal_failures:
             raise RuntimeError(

@@ -13,6 +13,8 @@ set -euo pipefail
 
 REPO_DIR=/public/home/xinwuye/ai4s-tool-joint-train/genmol
 CONFIG_PATH=${CONFIG_PATH:-configs/progen2_grpo_ng96_bs2_len256_rbs16.yaml}
+NUM_PROCESSES=${NUM_PROCESSES:-8}
+ACCELERATE_CONFIG_PATH=${ACCELERATE_CONFIG_PATH:-configs/accelerate_ddp_8gpu.yaml}
 PYTHON_OVERLAY_DIR=${PYTHON_OVERLAY_DIR:-/public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/python_overlay}
 PROTBERT_DIR=${PROTBERT_DIR:-/public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/prot_bert_bfd}
 CUDA_TOOLCHAIN_DIR=${CUDA_TOOLCHAIN_DIR:-/public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/cuda_toolchain_cu124}
@@ -23,6 +25,11 @@ export WANDB_PROJECT="${WANDB_PROJECT:-progen2}"
 export WANDB_NAME="${WANDB_NAME:-progen2-grpo-8gpu}"
 export PYTHON_OVERLAY_DIR
 export PROTBERT_DIR
+
+if ! [[ "${NUM_PROCESSES}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "NUM_PROCESSES must be a positive integer: ${NUM_PROCESSES}" >&2
+  exit 1
+fi
 
 source /public/home/xinwuye/miniconda/etc/profile.d/conda.sh
 conda activate genmol
@@ -94,6 +101,15 @@ export PYTHONPATH=${PYTHON_OVERLAY_DIR}:${REPO_DIR}/src
 
 cd "${REPO_DIR}"
 
+if [[ ! -f "${CONFIG_PATH}" ]]; then
+  echo "Missing training config: ${CONFIG_PATH}" >&2
+  exit 1
+fi
+if [[ ! -f "${ACCELERATE_CONFIG_PATH}" ]]; then
+  echo "Missing Accelerate config: ${ACCELERATE_CONFIG_PATH}" >&2
+  exit 1
+fi
+
 python - <<'PY'
 import importlib
 import os
@@ -107,8 +123,8 @@ PY
 
 MASTER_PORT=$((20000 + SLURM_JOB_ID % 10000))
 accelerate launch \
-  --config_file configs/accelerate_ddp_8gpu.yaml \
-  --num_processes 8 \
+  --config_file "${ACCELERATE_CONFIG_PATH}" \
+  --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MASTER_PORT}" \
   scripts/train_progen2_sgrpo.py \
   "${CONFIG_PATH}"

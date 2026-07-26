@@ -5,7 +5,6 @@ import os
 import random
 import re
 import shutil
-import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
@@ -259,6 +258,11 @@ def load_config(path):
     )
     if config.hbd and config.rl_algorithm != 'grpo':
         raise ValueError('hbd is only supported when rl_algorithm=grpo')
+    if config.hbd and config.gradient_accumulation_steps > 1:
+        raise ValueError(
+            'ProGen2 HBD does not support gradient_accumulation_steps > 1 '
+            'because HBD memory must be updated once from the full optimizer-step batch'
+        )
     if config.diverse_minibatch:
         if config.rl_algorithm != 'grpo':
             raise ValueError(
@@ -400,6 +404,38 @@ def default_reward_batch_size(config, *, num_generations=None):
     )
 
 
+def _aggregate_micro_batch_metrics(metrics_by_micro_batch):
+    if not metrics_by_micro_batch:
+        raise ValueError('metrics_by_micro_batch must be non-empty')
+    all_keys = set()
+    for metrics in metrics_by_micro_batch:
+        if not isinstance(metrics, dict):
+            raise TypeError('each micro-batch metrics payload must be a dict')
+        all_keys.update(metrics)
+
+    aggregated = {}
+    for key in sorted(all_keys):
+        values = []
+        for metrics in metrics_by_micro_batch:
+            if key not in metrics:
+                continue
+            try:
+                values.append(float(metrics[key]))
+            except (TypeError, ValueError) as exc:
+                raise TypeError(
+                    f'micro-batch metric {key!r} must be scalar, got {metrics[key]!r}'
+                ) from exc
+        if not values:
+            raise RuntimeError(f'micro-batch metric {key!r} has no values')
+        if key.endswith(('_count', '_sec', '_sec_total')):
+            aggregated[key] = sum(values)
+        elif key.startswith('cuda_') and ('_max_' in key or '_run_max_' in key):
+            aggregated[key] = max(values)
+        else:
+            aggregated[key] = sum(values) / len(values)
+    return aggregated
+
+
 def _merge_rollout_batches(batches, pad_token_id):
     if not batches:
         raise ValueError('cannot merge an empty rollout batch list')
@@ -477,7 +513,11 @@ class ProGen2SGRPOTrainer:
         set_seed(config.seed, device_specific=True)
 
         self.prompts = load_prompt_texts(config.prompt_path)
-        self._prompt_cursor = self.accelerator.process_index * config.per_device_prompt_batch_size
+        # Accumulation slots act as virtual ranks so 4x2 and 8x1 shard identically.
+        self.effective_world_size = (
+            self.accelerator.num_processes * config.gradient_accumulation_steps
+        )
+        self._prompt_cursor = self._prompt_cursor_after_steps(0)
         self.optimization_group_size = optimization_group_size(
             config.num_generations,
             enabled=config.diverse_minibatch,
@@ -695,14 +735,62 @@ class ProGen2SGRPOTrainer:
         dist.broadcast_object_list(container, src=0)
         return container[0]
 
-    def _next_prompt_batch(self):
-        batch = _cycle_prompt_batch(self.prompts, self.config.per_device_prompt_batch_size, self._prompt_cursor)
-        self._prompt_cursor = (self._prompt_cursor + self.config.per_device_prompt_batch_size) % len(self.prompts)
-        return batch
+    def _validate_accumulation_index(self, accumulation_index):
+        index = int(accumulation_index)
+        if not 0 <= index < self.config.gradient_accumulation_steps:
+            raise ValueError(
+                'accumulation_index must be in '
+                f'[0, {self.config.gradient_accumulation_steps}), got {accumulation_index}'
+            )
+        return index
+
+    def _virtual_process_index(self, accumulation_index):
+        index = self._validate_accumulation_index(accumulation_index)
+        return (
+            self.accelerator.process_index * self.config.gradient_accumulation_steps
+            + index
+        )
+
+    def _micro_batch_seed(self, accumulation_index):
+        self._validate_accumulation_index(accumulation_index)
+        return self.config.seed + self.global_step
+
+    def _selection_seed(self, accumulation_index):
+        virtual_process_index = self._virtual_process_index(accumulation_index)
+        return (
+            self.config.seed
+            + self.global_step * 10000
+            + virtual_process_index * 1000
+            + 991
+        )
+
+    def _next_prompt_batch(self, accumulation_index=0):
+        index = self._validate_accumulation_index(accumulation_index)
+        expected_cursor = self._prompt_cursor_after_steps(self.global_step)
+        if self._prompt_cursor != expected_cursor:
+            raise RuntimeError(
+                'prompt cursor drifted from optimizer-step state: '
+                f'{self._prompt_cursor} vs {expected_cursor}'
+            )
+        micro_batch_cursor = (
+            self._prompt_cursor
+            + index * self.config.per_device_prompt_batch_size
+        ) % len(self.prompts)
+        return _cycle_prompt_batch(
+            self.prompts,
+            self.config.per_device_prompt_batch_size,
+            micro_batch_cursor,
+        )
 
     def _prompt_cursor_after_steps(self, completed_steps):
+        completed_steps = int(completed_steps)
+        if completed_steps < 0:
+            raise ValueError(f'completed_steps must be non-negative, got {completed_steps}')
+        virtual_process_index = (
+            self.accelerator.process_index * self.config.gradient_accumulation_steps
+        )
         return (
-            (self.accelerator.process_index + int(completed_steps))
+            (virtual_process_index + completed_steps)
             * self.config.per_device_prompt_batch_size
         ) % len(self.prompts)
 
@@ -1155,6 +1243,257 @@ class ProGen2SGRPOTrainer:
         }
         return metrics, step_peak_reserved, step_peak_allocated
 
+    def _run_training_micro_batch(self, accumulation_index):
+        accumulation_index = self._validate_accumulation_index(accumulation_index)
+        rollout_phase_metrics = {}
+        reward_phase_metrics = {}
+        rollout_step_peak_reserved = 0
+        rollout_step_peak_allocated = 0
+        reward_step_peak_reserved = 0
+        reward_step_peak_allocated = 0
+
+        logger.info(
+            'Starting train step %d/%d micro-batch %d/%d',
+            self.global_step + 1,
+            self.config.max_steps,
+            accumulation_index + 1,
+            self.config.gradient_accumulation_steps,
+        )
+        if self.device.type == 'cuda':
+            self._reset_cuda_phase_peak()
+        prompts = self._next_prompt_batch(accumulation_index)
+        rollout = self._generate_rollouts(
+            prompts,
+            num_return_sequences=self.candidate_num_return_sequences,
+            seed=self._micro_batch_seed(accumulation_index),
+        )
+        rollout, active_mask, selection_metrics = self._select_diverse_rollout(
+            rollout,
+            seed=self._selection_seed(accumulation_index),
+        )
+        if self.device.type == 'cuda':
+            (
+                rollout_phase_metrics,
+                rollout_step_peak_reserved,
+                rollout_step_peak_allocated,
+            ) = self._capture_cuda_phase_peak('rollout')
+
+        if self.device.type == 'cuda':
+            self._reset_cuda_phase_peak()
+        rollout_rewards, reward_metrics, individual_reward_tensors = (
+            self._score_rollout_rewards(
+                rollout.protein_sequences,
+                step_number=self.global_step + 1,
+                active_mask=active_mask,
+            )
+        )
+        hbd_metrics = {}
+        if self._hbd_memory is not None:
+            rollout_rewards, hbd_metrics = self._apply_hbd(
+                rollout.protein_sequences,
+                rollout_rewards,
+            )
+        group_rewards = self._score_group_rewards(
+            rollout.protein_sequences,
+            active_mask=active_mask,
+        )
+        group_reward_credits = None
+        if self.config.rl_algorithm == 'sgrpo' and self.config.group_rewrad_credit == 'loo':
+            group_reward_credits = self._score_group_reward_credits(
+                rollout.protein_sequences
+            )
+        group_mean_individual_rewards = None
+        if any(
+            threshold is not None
+            for threshold in self.config.individual_reward_thresholds.values()
+        ):
+            group_mean_individual_rewards = self._build_group_mean_individual_rewards(
+                individual_reward_tensors
+            )
+        (
+            advantages,
+            group_advantages,
+            rollout_advantages,
+            advantage_metrics,
+        ) = self._compute_advantages(
+            rollout_rewards,
+            group_rewards,
+            group_mean_individual_rewards=group_mean_individual_rewards,
+            group_reward_credits=group_reward_credits,
+            sample_mask=active_mask if self.config.diverse_minibatch else None,
+        )
+        if self.device.type == 'cuda':
+            (
+                reward_phase_metrics,
+                reward_step_peak_reserved,
+                reward_step_peak_allocated,
+            ) = self._capture_cuda_phase_peak('reward')
+
+        if self.device.type == 'cuda':
+            self._reset_cuda_phase_peak()
+        with torch.no_grad():
+            old_log_probs, completion_mask = self.policy.per_token_logps(
+                rollout.full_token_ids,
+                rollout.full_attention_mask,
+                rollout.generated_mask,
+                requires_grad=False,
+            )
+            ref_log_probs, _ = self.reference.per_token_logps(
+                rollout.full_token_ids,
+                rollout.full_attention_mask,
+                rollout.generated_mask,
+                requires_grad=False,
+            )
+
+        policy_outputs = self.policy.per_token_logps(
+            rollout.full_token_ids,
+            rollout.full_attention_mask,
+            rollout.generated_mask,
+            requires_grad=True,
+            return_normalized_entropy=(
+                self.config.entropy_regularization_weight > 0.0
+            ),
+        )
+        if self.config.entropy_regularization_weight > 0.0:
+            (
+                new_log_probs,
+                completion_mask,
+                per_token_normalized_entropy,
+            ) = policy_outputs
+        else:
+            new_log_probs, completion_mask = policy_outputs
+            per_token_normalized_entropy = None
+        loss, loss_metrics = compute_clipped_grpo_loss(
+            new_log_probs=new_log_probs,
+            old_log_probs=old_log_probs,
+            advantages=advantages,
+            completion_mask=completion_mask,
+            epsilon=self.config.epsilon,
+            ref_log_probs=ref_log_probs,
+            beta=self.config.beta,
+        )
+        if self.config.entropy_regularization_weight > 0.0:
+            if per_token_normalized_entropy is None:
+                raise RuntimeError(
+                    'policy did not return entropy while entropy regularization is enabled'
+                )
+            entropy_mask = completion_mask.to(dtype=torch.float32)
+            normalized_entropy_mean = (
+                per_token_normalized_entropy[:, 0, :] * entropy_mask
+            ).sum() / entropy_mask.sum().clamp(min=1.0)
+            entropy_regularization_loss = -normalized_entropy_mean
+            loss = loss + (
+                self.config.entropy_regularization_weight
+                * entropy_regularization_loss
+            )
+            loss_metrics['entropy/normalized_mean'] = (
+                normalized_entropy_mean.detach()
+            )
+            loss_metrics['entropy/regularization_loss'] = (
+                entropy_regularization_loss.detach()
+            )
+
+        active_rollout_rewards = rollout_rewards[active_mask]
+        active_advantages = advantages[active_mask]
+        active_group_advantages = group_advantages[active_mask]
+        active_rollout_advantages = rollout_advantages[active_mask]
+        metrics = {
+            'loss': float(loss.detach().item()),
+            'reward_mean': float(active_rollout_rewards.mean().item()),
+            'group_reward_mean': float(
+                advantage_metrics.get('group_reward_mean', group_rewards.mean().item())
+            ),
+            'group_reward_raw_mean': float(
+                advantage_metrics.get(
+                    'group_reward_raw_mean',
+                    group_rewards.mean().item(),
+                )
+            ),
+            'group_reward_indicator_mean': float(
+                advantage_metrics.get('group_reward_indicator_mean', 1.0)
+            ),
+            'advantage_mean': float(active_advantages.mean().item()),
+            'group_advantage_mean': float(active_group_advantages.mean().item()),
+            'rollout_advantage_mean': float(active_rollout_advantages.mean().item()),
+            **{key: float(value) for key, value in reward_metrics.items()},
+            **selection_metrics,
+            **{f'hbd/{key}': float(value) for key, value in hbd_metrics.items()},
+            **{key: float(value) for key, value in advantage_metrics.items()},
+            **{
+                key: float(value.item() if hasattr(value, 'item') else value)
+                for key, value in loss_metrics.items()
+            },
+            **rollout_phase_metrics,
+            **reward_phase_metrics,
+        }
+        return {
+            'loss': loss,
+            'metrics': metrics,
+            'step_peak_reserved': [
+                rollout_step_peak_reserved,
+                reward_step_peak_reserved,
+            ],
+            'step_peak_allocated': [
+                rollout_step_peak_allocated,
+                reward_step_peak_allocated,
+            ],
+        }
+
+    def _finish_cuda_training_phase(self, micro_batch_result):
+        if self.device.type != 'cuda':
+            return
+        (
+            training_phase_metrics,
+            training_step_peak_reserved,
+            training_step_peak_allocated,
+        ) = self._capture_cuda_phase_peak('training')
+        micro_batch_result['metrics'].update(training_phase_metrics)
+        step_peak_reserved = max(
+            *micro_batch_result['step_peak_reserved'],
+            training_step_peak_reserved,
+        )
+        step_peak_allocated = max(
+            *micro_batch_result['step_peak_allocated'],
+            training_step_peak_allocated,
+        )
+        self._cuda_run_max_reserved = max(
+            self._cuda_run_max_reserved,
+            step_peak_reserved,
+        )
+        self._cuda_run_max_allocated = max(
+            self._cuda_run_max_allocated,
+            step_peak_allocated,
+        )
+        total_memory = float(torch.cuda.get_device_properties(self.device).total_memory)
+        micro_batch_result['metrics'].update(
+            {
+                'cuda_step_max_reserved_gib': float(
+                    step_peak_reserved / (1024 ** 3)
+                ),
+                'cuda_step_max_reserved_ratio': float(
+                    step_peak_reserved / total_memory
+                ),
+                'cuda_step_max_allocated_gib': float(
+                    step_peak_allocated / (1024 ** 3)
+                ),
+                'cuda_step_max_allocated_ratio': float(
+                    step_peak_allocated / total_memory
+                ),
+                'cuda_run_max_reserved_gib': float(
+                    self._cuda_run_max_reserved / (1024 ** 3)
+                ),
+                'cuda_run_max_reserved_ratio': float(
+                    self._cuda_run_max_reserved / total_memory
+                ),
+                'cuda_run_max_allocated_gib': float(
+                    self._cuda_run_max_allocated / (1024 ** 3)
+                ),
+                'cuda_run_max_allocated_ratio': float(
+                    self._cuda_run_max_allocated / total_memory
+                ),
+            }
+        )
+
     def train(self, resume_from_checkpoint=None):
         os.makedirs(self.output_dir, exist_ok=True)
         logger.info('Starting ProGen2 SGRPO training in %s', self.output_dir)
@@ -1165,203 +1504,61 @@ class ProGen2SGRPOTrainer:
             self.calibrate()
 
         while self.global_step < self.config.max_steps:
-            logger.info('Starting train step %d/%d', self.global_step + 1, self.config.max_steps)
-            rollout_phase_metrics = {}
-            reward_phase_metrics = {}
-            training_phase_metrics = {}
-            rollout_step_peak_reserved = 0
-            rollout_step_peak_allocated = 0
-            reward_step_peak_reserved = 0
-            reward_step_peak_allocated = 0
-            training_step_peak_reserved = 0
-            training_step_peak_allocated = 0
-
-            if self.device.type == 'cuda':
-                self._reset_cuda_phase_peak()
-            prompts = self._next_prompt_batch()
-            rollout = self._generate_rollouts(
-                prompts,
-                num_return_sequences=self.candidate_num_return_sequences,
-                seed=self.config.seed + self.global_step,
+            logger.info(
+                'Starting optimizer step %d/%d with %d micro-batches',
+                self.global_step + 1,
+                self.config.max_steps,
+                self.config.gradient_accumulation_steps,
             )
-            rollout, active_mask, selection_metrics = (
-                self._select_diverse_rollout(
-                    rollout,
-                    seed=(
-                        self.config.seed
-                        + self.global_step * 10000
-                        + self.accelerator.process_index * 1000
-                        + 991
-                    ),
-                )
-            )
-            if self.device.type == 'cuda':
-                rollout_phase_metrics, rollout_step_peak_reserved, rollout_step_peak_allocated = (
-                    self._capture_cuda_phase_peak('rollout')
-                )
-
-            if self.device.type == 'cuda':
-                self._reset_cuda_phase_peak()
-            rollout_rewards, reward_metrics, individual_reward_tensors = self._score_rollout_rewards(
-                rollout.protein_sequences,
-                step_number=self.global_step + 1,
-                active_mask=active_mask,
-            )
-            hbd_metrics = {}
-            if self._hbd_memory is not None:
-                rollout_rewards, hbd_metrics = self._apply_hbd(
-                    rollout.protein_sequences,
-                    rollout_rewards,
-                )
-            group_rewards = self._score_group_rewards(
-                rollout.protein_sequences,
-                active_mask=active_mask,
-            )
-            group_reward_credits = None
-            if self.config.rl_algorithm == 'sgrpo' and self.config.group_rewrad_credit == 'loo':
-                group_reward_credits = self._score_group_reward_credits(rollout.protein_sequences)
-            group_mean_individual_rewards = None
-            if any(threshold is not None for threshold in self.config.individual_reward_thresholds.values()):
-                group_mean_individual_rewards = self._build_group_mean_individual_rewards(individual_reward_tensors)
-            advantages, group_advantages, rollout_advantages, advantage_metrics = self._compute_advantages(
-                rollout_rewards,
-                group_rewards,
-                group_mean_individual_rewards=group_mean_individual_rewards,
-                group_reward_credits=group_reward_credits,
-                sample_mask=(
-                    active_mask
-                    if self.config.diverse_minibatch
-                    else None
-                ),
-            )
-            if self.device.type == 'cuda':
-                reward_phase_metrics, reward_step_peak_reserved, reward_step_peak_allocated = (
-                    self._capture_cuda_phase_peak('reward')
-                )
-
-            if self.device.type == 'cuda':
-                self._reset_cuda_phase_peak()
-            with torch.no_grad():
-                old_log_probs, completion_mask = self.policy.per_token_logps(
-                    rollout.full_token_ids,
-                    rollout.full_attention_mask,
-                    rollout.generated_mask,
-                    requires_grad=False,
-                )
-                ref_log_probs, _ = self.reference.per_token_logps(
-                    rollout.full_token_ids,
-                    rollout.full_attention_mask,
-                    rollout.generated_mask,
-                    requires_grad=False,
-                )
-
-            policy_outputs = self.policy.per_token_logps(
-                rollout.full_token_ids,
-                rollout.full_attention_mask,
-                rollout.generated_mask,
-                requires_grad=True,
-                return_normalized_entropy=(
-                    self.config.entropy_regularization_weight > 0.0
-                ),
-            )
-            if self.config.entropy_regularization_weight > 0.0:
-                (
-                    new_log_probs,
-                    completion_mask,
-                    per_token_normalized_entropy,
-                ) = policy_outputs
-            else:
-                new_log_probs, completion_mask = policy_outputs
-                per_token_normalized_entropy = None
-            loss, loss_metrics = compute_clipped_grpo_loss(
-                new_log_probs=new_log_probs,
-                old_log_probs=old_log_probs,
-                advantages=advantages,
-                completion_mask=completion_mask,
-                epsilon=self.config.epsilon,
-                ref_log_probs=ref_log_probs,
-                beta=self.config.beta,
-            )
-            if self.config.entropy_regularization_weight > 0.0:
-                if per_token_normalized_entropy is None:
-                    raise RuntimeError(
-                        'policy did not return entropy while entropy regularization is enabled'
-                    )
-                entropy_mask = completion_mask.to(dtype=torch.float32)
-                normalized_entropy_mean = (
-                    per_token_normalized_entropy[:, 0, :] * entropy_mask
-                ).sum() / entropy_mask.sum().clamp(min=1.0)
-                entropy_regularization_loss = -normalized_entropy_mean
-                loss = loss + (
-                    self.config.entropy_regularization_weight
-                    * entropy_regularization_loss
-                )
-                loss_metrics['entropy/normalized_mean'] = (
-                    normalized_entropy_mean.detach()
-                )
-                loss_metrics['entropy/regularization_loss'] = (
-                    entropy_regularization_loss.detach()
-                )
-
             self.optimizer.zero_grad(set_to_none=True)
-            self.accelerator.backward(loss)
-            self.accelerator.clip_grad_norm_(self.policy.model.trainable_parameters(), self.config.max_grad_norm)
+            micro_batch_results = []
+            for accumulation_index in range(
+                self.config.gradient_accumulation_steps
+            ):
+                micro_batch_result = self._run_training_micro_batch(
+                    accumulation_index
+                )
+                loss = micro_batch_result.pop('loss')
+                # Accelerate scales each backward call by gradient_accumulation_steps.
+                self.accelerator.backward(loss)
+                del loss
+                if (
+                    self.device.type == 'cuda'
+                    and accumulation_index
+                    < self.config.gradient_accumulation_steps - 1
+                ):
+                    self._finish_cuda_training_phase(micro_batch_result)
+                micro_batch_results.append(micro_batch_result)
+
+            grad_norm = self.accelerator.clip_grad_norm_(
+                self.policy.model.trainable_parameters(),
+                self.config.max_grad_norm,
+            )
             self.optimizer.step()
             self.scheduler.step()
             if self.device.type == 'cuda':
-                training_phase_metrics, training_step_peak_reserved, training_step_peak_allocated = (
-                    self._capture_cuda_phase_peak('training')
-                )
+                self._finish_cuda_training_phase(micro_batch_results[-1])
 
             self.global_step += 1
-            active_rollout_rewards = rollout_rewards[active_mask]
-            active_advantages = advantages[active_mask]
-            active_group_advantages = group_advantages[active_mask]
-            active_rollout_advantages = rollout_advantages[active_mask]
-            metrics = {
-                'loss': float(loss.detach().item()),
-                'reward_mean': float(active_rollout_rewards.mean().item()),
-                'group_reward_mean': float(advantage_metrics.get('group_reward_mean', group_rewards.mean().item())),
-                'group_reward_raw_mean': float(advantage_metrics.get('group_reward_raw_mean', group_rewards.mean().item())),
-                'group_reward_indicator_mean': float(advantage_metrics.get('group_reward_indicator_mean', 1.0)),
-                'advantage_mean': float(active_advantages.mean().item()),
-                'group_advantage_mean': float(active_group_advantages.mean().item()),
-                'rollout_advantage_mean': float(active_rollout_advantages.mean().item()),
-                **{key: float(value) for key, value in reward_metrics.items()},
-                **selection_metrics,
-                **{f'hbd/{key}': float(value) for key, value in hbd_metrics.items()},
-                **{key: float(value) for key, value in advantage_metrics.items()},
-                **{key: float(value.item() if hasattr(value, 'item') else value) for key, value in loss_metrics.items()},
-                **rollout_phase_metrics,
-                **reward_phase_metrics,
-                **training_phase_metrics,
-            }
-            if self.device.type == 'cuda':
-                total_memory = float(torch.cuda.get_device_properties(self.device).total_memory)
-                step_peak_reserved = max(
-                    rollout_step_peak_reserved,
-                    reward_step_peak_reserved,
-                    training_step_peak_reserved,
-                )
-                step_peak_allocated = max(
-                    rollout_step_peak_allocated,
-                    reward_step_peak_allocated,
-                    training_step_peak_allocated,
-                )
-                self._cuda_run_max_reserved = max(self._cuda_run_max_reserved, step_peak_reserved)
-                self._cuda_run_max_allocated = max(self._cuda_run_max_allocated, step_peak_allocated)
-                metrics.update(
-                    {
-                        'cuda_step_max_reserved_gib': float(step_peak_reserved / (1024 ** 3)),
-                        'cuda_step_max_reserved_ratio': float(step_peak_reserved / total_memory),
-                        'cuda_step_max_allocated_gib': float(step_peak_allocated / (1024 ** 3)),
-                        'cuda_step_max_allocated_ratio': float(step_peak_allocated / total_memory),
-                        'cuda_run_max_reserved_gib': float(self._cuda_run_max_reserved / (1024 ** 3)),
-                        'cuda_run_max_reserved_ratio': float(self._cuda_run_max_reserved / total_memory),
-                        'cuda_run_max_allocated_gib': float(self._cuda_run_max_allocated / (1024 ** 3)),
-                        'cuda_run_max_allocated_ratio': float(self._cuda_run_max_allocated / total_memory),
-                    }
-                )
+            self._prompt_cursor = self._prompt_cursor_after_steps(self.global_step)
+            metrics = _aggregate_micro_batch_metrics(
+                [result['metrics'] for result in micro_batch_results]
+            )
+            metrics.update(
+                {
+                    'grad_norm': float(
+                        grad_norm.item() if hasattr(grad_norm, 'item') else grad_norm
+                    ),
+                    'gradient_accumulation_steps': float(
+                        self.config.gradient_accumulation_steps
+                    ),
+                    'effective_world_size': float(self.effective_world_size),
+                    'effective_global_prompt_batch_size': float(
+                        self.effective_world_size
+                        * self.config.per_device_prompt_batch_size
+                    ),
+                }
+            )
             if self.global_step % self.config.logging_steps == 0:
                 self._log(metrics)
             if self.global_step % self.config.save_steps == 0:

@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from rl_shared.sgrpo import (
+    VALID_ADVANTAGE_BASELINES,
     VALID_GROUP_REWRAD_CREDITS,
     VALID_SGRPO_HIERARCHIES,
     compute_clipped_grpo_loss,

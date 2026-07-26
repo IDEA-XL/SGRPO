@@ -14,6 +14,7 @@ from accelerate import Accelerator
 from accelerate.utils import set_seed
 
 from genmol.rl.cpgrpo import (
+    VALID_ADVANTAGE_BASELINES,
     VALID_GROUP_REWRAD_CREDITS,
     VALID_SGRPO_HIERARCHIES,
     compute_clipped_grpo_loss,
@@ -68,6 +69,7 @@ class TrainConfig:
     beta: float = 0.01
     epsilon: float = 0.5
     scale_rewards: bool = False
+    advantage_baseline: str = 'leave_one_out'
     bf16: bool = True
     do_eval: bool = False
     num_generations: int = 8
@@ -158,6 +160,11 @@ def load_config(path):
     )
     if not 0.0 <= config.ref_model_mixup_alpha <= 1.0:
         raise ValueError('ref_model_mixup_alpha must be in [0, 1]')
+    if config.advantage_baseline not in VALID_ADVANTAGE_BASELINES:
+        raise ValueError(
+            f"advantage_baseline must be one of {sorted(VALID_ADVANTAGE_BASELINES)}, "
+            f'got {config.advantage_baseline!r}'
+        )
     if config.rl_algorithm not in {'coupled_grpo', 'coupled_sgrpo'}:
         raise ValueError(
             f"Unsupported rl_algorithm: {config.rl_algorithm}. Expected 'coupled_grpo' or 'coupled_sgrpo'"
@@ -1299,6 +1306,7 @@ class GenMolCpGRPOTrainer:
                 rewards=global_rewards,
                 num_generations=self.optimization_group_size,
                 scale_rewards=self.config.scale_rewards,
+                advantage_baseline=self.config.advantage_baseline,
                 sample_mask=(
                     global_active_mask
                     if self.config.diverse_minibatch
@@ -1321,6 +1329,7 @@ class GenMolCpGRPOTrainer:
                 group_rewrad_credit=self.config.group_rewrad_credit,
                 group_rewrad_credit_temperature=self.config.group_rewrad_credit_temperature,
                 group_reward_credits=global_group_reward_credits,
+                advantage_baseline=self.config.advantage_baseline,
             )
             local_advantages = global_advantages[local_start:local_end].to(device=self.device)
             global_reward_std = torch.full_like(global_rewards, float(sgrpo_metrics['rollout_reward_std_mean']))

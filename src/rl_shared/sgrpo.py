@@ -4,6 +4,20 @@ import torch
 
 VALID_SGRPO_HIERARCHIES = {'advantage_sum', 'reward_sum', 'hierarchical_sum'}
 VALID_GROUP_REWRAD_CREDITS = {'broadcast', 'loo'}
+VALID_ADVANTAGE_BASELINES = {'leave_one_out', 'mean'}
+
+
+def _dense_group_baseline(rewards_grouped, advantage_baseline):
+    if advantage_baseline not in VALID_ADVANTAGE_BASELINES:
+        raise ValueError(
+            f"advantage_baseline must be one of {sorted(VALID_ADVANTAGE_BASELINES)}, "
+            f'got {advantage_baseline!r}'
+        )
+    if advantage_baseline == 'mean':
+        return rewards_grouped.mean(dim=1, keepdim=True)
+    return (
+        rewards_grouped.sum(dim=1, keepdim=True) - rewards_grouped
+    ) / (rewards_grouped.size(1) - 1)
 
 
 def normalize_reward_thresholds(thresholds):
@@ -71,6 +85,7 @@ def compute_grouped_advantages(
     num_generations,
     scale_rewards=False,
     sample_mask=None,
+    advantage_baseline='leave_one_out',
 ):
     if rewards.dim() != 1:
         raise ValueError('rewards must be a 1D tensor')
@@ -81,8 +96,10 @@ def compute_grouped_advantages(
 
     rewards_grouped = rewards.view(-1, num_generations)
     if sample_mask is None:
-        sum_group = rewards_grouped.sum(dim=1, keepdim=True)
-        baseline = (sum_group - rewards_grouped) / (num_generations - 1)
+        baseline = _dense_group_baseline(
+            rewards_grouped,
+            advantage_baseline,
+        )
         advantages = (rewards_grouped - baseline).view(-1)
         std_grouped = rewards_grouped.std(dim=1, keepdim=True)
         repeated_std = std_grouped.repeat_interleave(num_generations, dim=1).view(-1)
@@ -115,15 +132,25 @@ def compute_grouped_advantages(
         torch.zeros_like(rewards_grouped),
     )
     sum_group = masked_rewards.sum(dim=1, keepdim=True)
-    loo_denominator = (active_counts - 1).clamp(min=1).to(dtype=rewards.dtype)
-    baseline = (sum_group - rewards_grouped) / loo_denominator
+    active_counts_float = active_counts.to(dtype=rewards.dtype)
+    if advantage_baseline == 'mean':
+        baseline = sum_group / active_counts_float
+        active_advantage_mask = mask_grouped
+    elif advantage_baseline == 'leave_one_out':
+        loo_denominator = (active_counts - 1).clamp(min=1).to(dtype=rewards.dtype)
+        baseline = (sum_group - rewards_grouped) / loo_denominator
+        active_advantage_mask = mask_grouped & (active_counts > 1)
+    else:
+        raise ValueError(
+            f"advantage_baseline must be one of {sorted(VALID_ADVANTAGE_BASELINES)}, "
+            f'got {advantage_baseline!r}'
+        )
     grouped_advantages = torch.where(
-        mask_grouped & (active_counts > 1),
+        active_advantage_mask,
         rewards_grouped - baseline,
         torch.zeros_like(rewards_grouped),
     )
 
-    active_counts_float = active_counts.to(dtype=rewards.dtype)
     means = sum_group / active_counts_float
     squared_deviations = torch.where(
         mask_grouped,
@@ -161,6 +188,7 @@ def compute_hierarchical_sum_advantages(
     supergroup_num_groups,
     group_advantage_weight,
     scale_rewards=False,
+    advantage_baseline='leave_one_out',
 ):
     if rollout_rewards.dim() != 1:
         raise ValueError('rollout_rewards must be a 1D tensor')
@@ -196,14 +224,14 @@ def compute_hierarchical_sum_advantages(
     )
 
     rollout_rewards_grouped = rollout_rewards.view(num_groups, num_generations)
-    rollout_baseline = (
-        (rollout_rewards_grouped.sum(dim=1, keepdim=True) - rollout_rewards_grouped)
-        / (num_generations - 1)
+    rollout_baseline = _dense_group_baseline(
+        rollout_rewards_grouped,
+        advantage_baseline,
     ).view(-1)
     group_rewards_grouped = group_rewards.view(-1, supergroup_num_groups)
-    group_baseline = (
-        (group_rewards_grouped.sum(dim=1, keepdim=True) - group_rewards_grouped)
-        / (supergroup_num_groups - 1)
+    group_baseline = _dense_group_baseline(
+        group_rewards_grouped,
+        advantage_baseline,
     ).view(-1).repeat_interleave(num_generations)
     baseline = rollout_baseline * rollout_advantage_weight + group_baseline * group_advantage_weight
     advantages = combined_rewards - baseline
@@ -299,6 +327,7 @@ def compute_sgrpo_advantages(
     group_rewrad_credit='broadcast',
     group_rewrad_credit_temperature=1.0,
     group_reward_credits=None,
+    advantage_baseline='leave_one_out',
 ):
     if rollout_rewards.dim() != 1:
         raise ValueError('rollout_rewards must be a 1D tensor')
@@ -353,11 +382,13 @@ def compute_sgrpo_advantages(
         rewards=rollout_rewards,
         num_generations=rollout_supergroup_size,
         scale_rewards=scale_rewards,
+        advantage_baseline=advantage_baseline,
     )
     group_advantages, group_reward_std, group_zero_std_ratio = compute_grouped_advantages(
         rewards=gated_group_rewards,
         num_generations=supergroup_num_groups,
         scale_rewards=scale_rewards,
+        advantage_baseline=advantage_baseline,
     )
     if group_rewrad_credit == 'loo':
         normalized_group_reward_credits = _normalize_group_reward_credits(
@@ -399,6 +430,7 @@ def compute_sgrpo_advantages(
             rewards=combined_rewards,
             num_generations=rollout_supergroup_size,
             scale_rewards=scale_rewards,
+            advantage_baseline=advantage_baseline,
         )
         combined_reward_mean = combined_rewards.mean().item()
     else:
@@ -408,14 +440,14 @@ def compute_sgrpo_advantages(
                 + expanded_group_rewards * group_advantage_weight
             )
             rollout_rewards_grouped = rollout_rewards.view(num_groups, num_generations)
-            rollout_baseline = (
-                (rollout_rewards_grouped.sum(dim=1, keepdim=True) - rollout_rewards_grouped)
-                / (num_generations - 1)
+            rollout_baseline = _dense_group_baseline(
+                rollout_rewards_grouped,
+                advantage_baseline,
             ).view(-1)
             group_rewards_grouped = gated_group_rewards.view(-1, supergroup_num_groups)
-            group_baseline = (
-                (group_rewards_grouped.sum(dim=1, keepdim=True) - group_rewards_grouped)
-                / (supergroup_num_groups - 1)
+            group_baseline = _dense_group_baseline(
+                group_rewards_grouped,
+                advantage_baseline,
             ).view(-1).repeat_interleave(num_generations)
             baseline = rollout_baseline * rollout_advantage_weight + group_baseline * group_advantage_weight
             final_advantages = combined_rewards - baseline
@@ -438,6 +470,7 @@ def compute_sgrpo_advantages(
                     supergroup_num_groups=supergroup_num_groups,
                     group_advantage_weight=group_advantage_weight,
                     scale_rewards=scale_rewards,
+                    advantage_baseline=advantage_baseline,
                 )
             )
 
@@ -458,6 +491,7 @@ def compute_sgrpo_advantages(
         'combined_reward_mean': combined_reward_mean,
         'group_rewrad_credit_loo_enabled': 1.0 if group_rewrad_credit == 'loo' else 0.0,
         'group_rewrad_credit_temperature': float(group_rewrad_credit_temperature),
+        'advantage_baseline_mean_enabled': 1.0 if advantage_baseline == 'mean' else 0.0,
     }
     if normalized_group_reward_credits is not None:
         metrics['group_rewrad_credit_mean'] = normalized_group_reward_credits.mean().item()

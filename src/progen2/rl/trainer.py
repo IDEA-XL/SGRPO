@@ -38,6 +38,7 @@ from progen2.rewards.composite import (
 from progen2.rl.policy import ProGen2Policy, ProGen2RolloutBatch
 from rl_shared.sampling import normalize_scalar_or_range, sample_scalar_or_range
 from rl_shared.sgrpo import (
+    VALID_ADVANTAGE_BASELINES,
     VALID_GROUP_REWRAD_CREDITS,
     VALID_SGRPO_HIERARCHIES,
     compute_clipped_grpo_loss,
@@ -93,6 +94,7 @@ class ProGen2TrainConfig:
     num_generations: int = 4
     supergroup_num_groups: int = 2
     group_advantage_weight: float = 0.5
+    advantage_baseline: str = 'leave_one_out'
     hierarchy: str = 'advantage_sum'
     naturalness: float | None = None
     foldability: float | None = None
@@ -195,6 +197,11 @@ def load_config(path):
         raise ValueError('supergroup_num_groups must be greater than 1 for sgrpo')
     if not 0.0 <= config.group_advantage_weight <= 1.0:
         raise ValueError('group_advantage_weight must be in [0, 1]')
+    if config.advantage_baseline not in VALID_ADVANTAGE_BASELINES:
+        raise ValueError(
+            f"advantage_baseline must be one of {sorted(VALID_ADVANTAGE_BASELINES)}, "
+            f'got {config.advantage_baseline!r}'
+        )
     config.rollout_reward_weights = normalize_protein_reward_weights(
         {
             'naturalness': config.naturalness,
@@ -1152,6 +1159,7 @@ class ProGen2SGRPOTrainer:
                     group_rewrad_credit=self.config.group_rewrad_credit,
                     group_rewrad_credit_temperature=self.config.group_rewrad_credit_temperature,
                     group_reward_credits=prompt_group_reward_credits,
+                    advantage_baseline=self.config.advantage_baseline,
                 )
             else:
                 prompt_adv, _, zero_std_ratio = compute_grouped_advantages(
@@ -1159,6 +1167,7 @@ class ProGen2SGRPOTrainer:
                     num_generations=self.optimization_group_size,
                     scale_rewards=False,
                     sample_mask=prompt_sample_mask,
+                    advantage_baseline=self.config.advantage_baseline,
                 )
                 prompt_rollout_adv = prompt_adv
                 prompt_group_adv = torch.zeros_like(prompt_rollout_rewards)

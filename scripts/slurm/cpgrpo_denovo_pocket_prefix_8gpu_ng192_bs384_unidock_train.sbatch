@@ -26,6 +26,8 @@ fi
 
 export WANDB_PROJECT="${WANDB_PROJECT:-tools4sys}"
 export WANDB_NAME="${WANDB_NAME:-cpgrpo-denovo-pocket-prefix-8gpu-ng192-bs384-unidock}"
+export WANDB_DISABLE_SERVICE="${WANDB_DISABLE_SERVICE:-true}"
+export WANDB_START_METHOD="${WANDB_START_METHOD:-thread}"
 
 source /public/home/xinwuye/miniconda/etc/profile.d/conda.sh
 conda activate "${CONDA_ENV_PREFIX}"
@@ -38,10 +40,15 @@ export HF_HOME=/tmp/xinwuye_hf_mmunidock8_${SLURM_JOB_ID}
 export HF_DATASETS_CACHE=${HF_HOME}/datasets
 export HF_HUB_CACHE=${HF_HOME}/hub
 export TRANSFORMERS_CACHE=${HF_HOME}/transformers
+export TRITON_CACHE_DIR=${HF_HOME}/triton_cache
+export TMPDIR=/tmp/xinwuye_tmp_mmunidock8_${SLURM_JOB_ID}
+export TMP=${TMPDIR}
+export TEMP=${TMPDIR}
 export PYTHONPATH=src
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export GENMOL_REWARD_WORKERS
+mkdir -p "${HF_HOME}" "${TRITON_CACHE_DIR}" "${TMPDIR}"
 
 if [[ "${http_proxy:-}${https_proxy:-}${all_proxy:-}" == *"127.0.0.1:7897"* ]]; then
   if ! pgrep -u "$USER" -f "${MIHOMO_DIR}/mihomo" >/dev/null 2>&1; then

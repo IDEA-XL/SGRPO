@@ -962,11 +962,24 @@ def _select_gpu_tasks(
     groups: dict[str, GroupSpec],
     ready: dict[str, list[TaskSpec]],
     capacity: int,
+    start_group: str | None,
 ) -> dict[str, list[TaskSpec]]:
+    gpu_group_names = [
+        group_name
+        for group_name, group in groups.items()
+        if group.resource == "gpu"
+    ]
+    if start_group is not None:
+        if start_group not in gpu_group_names:
+            raise ValueError(f"Unknown GPU scheduling cursor: {start_group}")
+        start_index = gpu_group_names.index(start_group)
+        gpu_group_names = (
+            gpu_group_names[start_index:] + gpu_group_names[:start_index]
+        )
     queues = {
         group_name: list(ready.get(group_name, []))
-        for group_name, group in groups.items()
-        if group.resource == "gpu" and ready.get(group_name)
+        for group_name in gpu_group_names
+        if ready.get(group_name)
     }
     selected: dict[str, list[TaskSpec]] = {}
     while capacity > 0 and queues:
@@ -987,6 +1000,21 @@ def _select_gpu_tasks(
     return selected
 
 
+def _next_gpu_group(
+    groups: dict[str, GroupSpec],
+    current_group: str,
+) -> str:
+    gpu_group_names = [
+        group_name
+        for group_name, group in groups.items()
+        if group.resource == "gpu"
+    ]
+    if current_group not in gpu_group_names:
+        raise ValueError(f"Unknown GPU group: {current_group}")
+    current_index = gpu_group_names.index(current_group)
+    return gpu_group_names[(current_index + 1) % len(gpu_group_names)]
+
+
 def _schedule_gpu_tasks(
     state: dict,
     groups: dict[str, GroupSpec],
@@ -994,10 +1022,17 @@ def _schedule_gpu_tasks(
     gpu_submitted_count: int,
 ) -> None:
     capacity = max(0, GPU_MAX_SUBMITTED_JOBS - gpu_submitted_count)
-    selected_by_group = _select_gpu_tasks(groups, ready, capacity)
+    selected_by_group = _select_gpu_tasks(
+        groups,
+        ready,
+        capacity,
+        state.get("gpu_group_cursor"),
+    )
     for group_name, selected in selected_by_group.items():
         if not _submit_group(state, groups[group_name], selected):
             break
+        state["gpu_group_cursor"] = _next_gpu_group(groups, group_name)
+        _atomic_write_state(state)
 
 
 def _progress_summary(state: dict, tasks: dict[str, TaskSpec]) -> str:

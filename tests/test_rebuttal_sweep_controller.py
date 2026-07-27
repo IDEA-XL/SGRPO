@@ -160,6 +160,98 @@ class RebuttalSweepControllerTest(unittest.TestCase):
             (checkpoint / "trainer_state.pt").write_bytes(b"state")
             self.assertTrue(controller._progen2_checkpoint_ready(checkpoint))
 
+    def test_gpu_task_selection_starts_from_persisted_cursor(self):
+        groups = {
+            name: controller.GroupSpec(
+                name=name,
+                resource="gpu",
+                script=Path(f"{name}.sbatch"),
+                job_name=name,
+                output_pattern=Path(f"{name}.out"),
+                error_pattern=Path(f"{name}.err"),
+            )
+            for name in ("first", "second", "third")
+        }
+        ready = {
+            name: [
+                controller.TaskSpec(
+                    key=f"{name}:0",
+                    group=name,
+                    array_id=0,
+                    prerequisites=(),
+                    validator=lambda: False,
+                )
+            ]
+            for name in groups
+        }
+
+        selected = controller._select_gpu_tasks(
+            groups,
+            ready,
+            capacity=1,
+            start_group="second",
+        )
+
+        self.assertEqual(list(selected), ["second"])
+
+    def test_gpu_scheduler_advances_cursor_after_each_submission(self):
+        groups = {
+            name: controller.GroupSpec(
+                name=name,
+                resource="gpu",
+                script=Path(f"{name}.sbatch"),
+                job_name=name,
+                output_pattern=Path(f"{name}.out"),
+                error_pattern=Path(f"{name}.err"),
+            )
+            for name in ("first", "second", "third")
+        }
+        ready = {
+            name: [
+                controller.TaskSpec(
+                    key=f"{name}:0",
+                    group=name,
+                    array_id=0,
+                    prerequisites=(),
+                    validator=lambda: False,
+                )
+            ]
+            for name in groups
+        }
+        state = {"tasks": {}, "submissions": []}
+
+        with (
+            mock.patch.object(
+                controller,
+                "GPU_MAX_SUBMITTED_JOBS",
+                1,
+            ),
+            mock.patch.object(
+                controller,
+                "_submit_group",
+                return_value=True,
+            ) as submit_group,
+            mock.patch.object(controller, "_atomic_write_state"),
+        ):
+            controller._schedule_gpu_tasks(
+                state,
+                groups,
+                ready,
+                gpu_submitted_count=0,
+            )
+            controller._schedule_gpu_tasks(
+                state,
+                groups,
+                ready,
+                gpu_submitted_count=0,
+            )
+
+        submitted_names = [
+            call.args[1].name for call in submit_group.call_args_list
+        ]
+        self.assertEqual(submitted_names, ["first", "second"])
+        self.assertEqual(state["gpu_group_cursor"], "third")
+
 
 if __name__ == "__main__":
     unittest.main()

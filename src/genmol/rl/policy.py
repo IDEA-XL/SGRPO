@@ -200,11 +200,8 @@ class GenMolCpGRPOPolicy:
         cached = self._motif_token_cache.get(fragment)
         if cached is not None:
             return cached.clone()
-        if self.use_bracket_safe:
-            raise ValueError(
-                'motif-extension rollout requires the standard SAFE tokenizer, '
-                'not bracket-SAFE'
-            )
+        # Official GenMol fragment_completion uses standard SAFE encoding for
+        # both GenMol variants; the v2 tokenizer contains these tokens too.
         encoded_fragment = (
             sf.SAFEConverter(ignore_stereo=True).encoder(
                 fragment,

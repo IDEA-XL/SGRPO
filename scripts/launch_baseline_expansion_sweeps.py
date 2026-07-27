@@ -242,7 +242,7 @@ def main() -> None:
     submit_command = [
         str(SBATCH),
         "--parsable",
-        "--exclude=server13",
+        "--exclude=server13,server59",
         str(
             REPO_ROOT
             / "scripts/slurm/drive_baseline_expansion_sweeps_cpu.sbatch"

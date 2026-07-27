@@ -4,7 +4,8 @@
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=256G
-#SBATCH -t 48:00:00
+#SBATCH -t 16:00:00
+#SBATCH --exclude=server13,server59
 #SBATCH -J p2grpo8g
 #SBATCH -o slurm_progen2_grpo_8gpu_%j.out
 #SBATCH -e slurm_progen2_grpo_8gpu_%j.err

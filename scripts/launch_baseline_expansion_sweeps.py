@@ -30,9 +30,7 @@ MMGENMOL_ENTROPY_CONFIG = (
     "cpgrpo_denovo_pocket_prefix_entropy001_ng192_bs384_lr5e-5_beta5e-3_"
     "ni1_q03_sa02_unidock05_stl0"
 )
-PROGEN2_DMB_CONFIG = (
-    "progen2_dmb_grpo_4gpu_ga2_ng192_bs2_len256_rbs16_ms100"
-)
+PROGEN2_DMB_CONFIG = "progen2_dmb_grpo_ng192_bs2_len256_rbs16_ms100"
 PROGEN2_ENTROPY_CONFIG = "progen2_entropy001_grpo_ng96_bs2_len256_rbs16_ms100"
 
 

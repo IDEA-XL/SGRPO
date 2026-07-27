@@ -3,7 +3,9 @@ import logging
 import math
 import os
 import re
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 
@@ -56,6 +58,17 @@ from rl_shared.sampling import normalize_scalar_or_range
 
 logger = logging.getLogger(__name__)
 GENMOL_SGRPO_THRESHOLD_REWARD_NAMES = ('qed', 'sa_score')
+PROFILE_TIMING_PHASES = (
+    'generation_sec',
+    'reward_sec',
+    'diversity_sec',
+    'reference_forward_sec',
+    'preparation_other_sec',
+    'policy_forward_backward_sec',
+    'optimizer_update_sec',
+    'logging_sec',
+    'checkpoint_sec',
+)
 
 
 @dataclass
@@ -122,6 +135,7 @@ class TrainConfig:
     diverse_minibatch: bool = False
     diverse_minibatch_oversample_factor: int = 2
     entropy_regularization_weight: float = 0.0
+    profile_step_timing: bool = False
 
 
 @dataclass
@@ -544,6 +558,7 @@ class GenMolCpGRPOTrainer:
             self._hbd_memory = build_molecule_hbd_memory(hbd_config)
         self.metrics_path = os.path.join(output_dir, 'metrics.jsonl')
         self.text_logs_path = os.path.join(output_dir, 'completions.jsonl')
+        self.timings_path = os.path.join(output_dir, 'timings.jsonl')
         self.state_path = os.path.join(output_dir, 'trainer_state.json')
 
         self.global_step = 0
@@ -552,6 +567,7 @@ class GenMolCpGRPOTrainer:
         self._buffered_inputs = None
         self._buffer_metadata = None
         self._last_train_metrics = None
+        self._pending_profile_timings = None
         self._metrics = {'train': defaultdict(list), 'eval': defaultdict(list)}
         self._textual_logs = {'train': [], 'eval': []}
         self._last_reward_metrics = {'train': None, 'eval': None}
@@ -571,6 +587,77 @@ class GenMolCpGRPOTrainer:
             self.global_sample_count,
             self.reward_model.num_workers,
         )
+
+    def _synchronize_profile_device(self):
+        if self.config.profile_step_timing and self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+
+    def _start_profile_timer(self):
+        if not self.config.profile_step_timing:
+            return None
+        self._synchronize_profile_device()
+        return time.perf_counter()
+
+    def _stop_profile_timer(self, started_at):
+        if started_at is None:
+            return None
+        self._synchronize_profile_device()
+        return time.perf_counter() - started_at
+
+    @contextmanager
+    def _profile_phase(self, timings, name):
+        if not self.config.profile_step_timing:
+            yield
+            return
+        started_at = self._start_profile_timer()
+        try:
+            yield
+        finally:
+            elapsed = self._stop_profile_timer(started_at)
+            timings[name] = timings.get(name, 0.0) + elapsed
+
+    @staticmethod
+    def _merge_profile_timings(target, source):
+        for name, value in source.items():
+            target[name] = target.get(name, 0.0) + float(value)
+
+    def _write_step_timings(self, step, timings, step_total_sec):
+        if not self.config.profile_step_timing:
+            return
+        tracked_sec = sum(float(timings.get(name, 0.0)) for name in PROFILE_TIMING_PHASES)
+        residual_sec = float(step_total_sec) - tracked_sec
+        if residual_sec < -1e-6:
+            raise RuntimeError(
+                'profile phase timings exceed total step time: '
+                f'{tracked_sec:.6f} vs {step_total_sec:.6f}'
+            )
+        payload = {
+            'step': int(step),
+            'global_sample_count': int(self.global_sample_count),
+            **{name: float(timings.get(name, 0.0)) for name in PROFILE_TIMING_PHASES},
+            'residual_sec': max(0.0, residual_sec),
+            'step_total_sec': float(step_total_sec),
+        }
+        if self.accelerator.is_main_process:
+            write_jsonl(self.timings_path, payload)
+            logger.info(
+                'timing step=%s generation_sec=%.6f reward_sec=%.6f diversity_sec=%.6f '
+                'reference_forward_sec=%.6f preparation_other_sec=%.6f '
+                'policy_forward_backward_sec=%.6f optimizer_update_sec=%.6f '
+                'logging_sec=%.6f checkpoint_sec=%.6f residual_sec=%.6f step_total_sec=%.6f',
+                payload['step'],
+                payload['generation_sec'],
+                payload['reward_sec'],
+                payload['diversity_sec'],
+                payload['reference_forward_sec'],
+                payload['preparation_other_sec'],
+                payload['policy_forward_backward_sec'],
+                payload['optimizer_update_sec'],
+                payload['logging_sec'],
+                payload['checkpoint_sec'],
+                payload['residual_sec'],
+                payload['step_total_sec'],
+            )
 
     def _record_reward_metrics(self, mode, metadata):
         if mode not in self._metrics:
@@ -876,6 +963,8 @@ class GenMolCpGRPOTrainer:
         return records
 
     def _generate_and_score_completions(self, mode):
+        preparation_started_at = self._start_profile_timer()
+        profile_timings = {}
         cycle_seed = self.config.seed + self.generation_cycle_idx * 10000
         if self.accelerator.is_main_process:
             if self.config.rl_algorithm == 'coupled_sgrpo':
@@ -916,11 +1005,12 @@ class GenMolCpGRPOTrainer:
         candidate_local_end = candidate_local_start + self.local_candidate_count
         local_specs = expanded_specs[candidate_local_start:candidate_local_end]
         rollout_seed = cycle_seed + self.accelerator.process_index * 1000
-        rollout = self.policy.rollout_specs(
-            specs=local_specs,
-            generation_batch_size=self.config.generation_batch_size,
-            seed=rollout_seed,
-        )
+        with self._profile_phase(profile_timings, 'generation_sec'):
+            rollout = self.policy.rollout_specs(
+                specs=local_specs,
+                generation_batch_size=self.config.generation_batch_size,
+                seed=rollout_seed,
+            )
         rollout, local_specs, local_active_mask, selection_metrics = (
             self._select_diverse_rollout(
                 rollout,
@@ -929,10 +1019,11 @@ class GenMolCpGRPOTrainer:
             )
         )
 
-        reward_records = self._score_selected_rollout(
-            rollout,
-            local_active_mask,
-        )
+        with self._profile_phase(profile_timings, 'reward_sec'):
+            reward_records = self._score_selected_rollout(
+                rollout,
+                local_active_mask,
+            )
         local_rewards = torch.tensor([record.reward for record in reward_records], device=self.device, dtype=torch.float32)
         global_rewards = self.accelerator.gather(local_rewards).detach()
         global_active_mask = self.accelerator.gather(local_active_mask).detach()
@@ -967,22 +1058,23 @@ class GenMolCpGRPOTrainer:
                     global_memory_scores=global_soft_for_hbd,
                     global_reward_values=global_rewards,
                 )
-            group_diversities = []
-            group_diversity_credits = []
-            for group_start in range(0, len(global_smiles), self.config.num_generations):
-                group_smiles = global_smiles[group_start:group_start + self.config.num_generations]
-                if self.config.group_rewrad_credit == 'loo':
-                    group_diversity, credits = compute_molecular_diversity_with_loo_credits(
-                        group_smiles,
-                        metric=self.config.diversity_metric,
-                    )
-                    group_diversity_credits.extend(credits)
-                else:
-                    group_diversity = compute_molecular_diversity(
-                        group_smiles,
-                        metric=self.config.diversity_metric,
-                    )
-                group_diversities.append(group_diversity)
+            with self._profile_phase(profile_timings, 'diversity_sec'):
+                group_diversities = []
+                group_diversity_credits = []
+                for group_start in range(0, len(global_smiles), self.config.num_generations):
+                    group_smiles = global_smiles[group_start:group_start + self.config.num_generations]
+                    if self.config.group_rewrad_credit == 'loo':
+                        group_diversity, credits = compute_molecular_diversity_with_loo_credits(
+                            group_smiles,
+                            metric=self.config.diversity_metric,
+                        )
+                        group_diversity_credits.extend(credits)
+                    else:
+                        group_diversity = compute_molecular_diversity(
+                            group_smiles,
+                            metric=self.config.diversity_metric,
+                        )
+                    group_diversities.append(group_diversity)
             global_group_rewards = torch.tensor(group_diversities, device=self.device, dtype=torch.float32)
             if self.config.group_rewrad_credit == 'loo':
                 global_group_reward_credits = torch.tensor(
@@ -1130,14 +1222,15 @@ class GenMolCpGRPOTrainer:
         if self.config.beta == 0.0:
             ref_per_token_logps = None
         else:
-            ref_per_token_logps = self.reference.per_token_logps(
-                input_ids=expanded_ids,
-                logits_to_keep=logits_to_keep,
-                completion_mask=rollout.completion_mask,
-                mask_seeds=mask_seeds,
-                gradient_accumulation_steps=self.config.gradient_accumulation_steps,
-                requires_grad=False,
-            )
+            with self._profile_phase(profile_timings, 'reference_forward_sec'):
+                ref_per_token_logps = self.reference.per_token_logps(
+                    input_ids=expanded_ids,
+                    logits_to_keep=logits_to_keep,
+                    completion_mask=rollout.completion_mask,
+                    mask_seeds=mask_seeds,
+                    gradient_accumulation_steps=self.config.gradient_accumulation_steps,
+                    requires_grad=False,
+                )
 
         log_rows = []
         for spec, safe_string, record, final_reward, is_active in zip(
@@ -1191,6 +1284,25 @@ class GenMolCpGRPOTrainer:
         metadata.update(extra_advantage_metrics)
         self._record_reward_metrics(mode, metadata)
         self._record_text_logs(mode, log_rows)
+        preparation_total_sec = self._stop_profile_timer(preparation_started_at)
+        if preparation_total_sec is not None:
+            tracked_preparation_sec = sum(
+                float(profile_timings.get(name, 0.0))
+                for name in (
+                    'generation_sec',
+                    'reward_sec',
+                    'diversity_sec',
+                    'reference_forward_sec',
+                )
+            )
+            preparation_other_sec = preparation_total_sec - tracked_preparation_sec
+            if preparation_other_sec < -1e-6:
+                raise RuntimeError(
+                    'profile preparation phases exceed total preparation time: '
+                    f'{tracked_preparation_sec:.6f} vs {preparation_total_sec:.6f}'
+                )
+            profile_timings['preparation_other_sec'] = max(0.0, preparation_other_sec)
+            metadata['_profile_timings'] = profile_timings
 
         return {
             'prompt_ids': rollout.prompt_ids,
@@ -1209,6 +1321,10 @@ class GenMolCpGRPOTrainer:
             accumulated_local_batch, metadata = self._generate_and_score_completions(mode=mode)
             self._buffered_inputs = split_tensor_dict(accumulated_local_batch, self.config.gradient_accumulation_steps)
             self._buffer_metadata = metadata
+            if self.config.profile_step_timing:
+                if self._pending_profile_timings is not None:
+                    raise RuntimeError('unconsumed profile timings before generating a new rollout')
+                self._pending_profile_timings = dict(metadata.get('_profile_timings', {}))
             self.generation_cycle_idx += 1
 
         inputs = self._buffered_inputs[self._step % self.config.gradient_accumulation_steps]
@@ -1524,6 +1640,7 @@ class GenMolCpGRPOTrainer:
             self._hbd_memory.load_state_dict(hbd_state)
         self._buffered_inputs = None
         self._buffer_metadata = None
+        self._pending_profile_timings = None
 
     def train(self, resume_from_checkpoint=None):
         if resume_from_checkpoint is not None:
@@ -1531,21 +1648,28 @@ class GenMolCpGRPOTrainer:
             self._load_checkpoint(resume_from_checkpoint)
 
         while self.global_step < self.config.max_steps:
+            step_started_at = self._start_profile_timer()
+            step_timings = {}
             self.optimizer.zero_grad(set_to_none=True)
 
             for _ in range(self.config.gradient_accumulation_steps):
                 inputs = self._prepare_inputs(mode='train')
-                loss = self._compute_loss(inputs, mode='train', requires_grad=True)
-                self.accelerator.backward(loss / self.config.gradient_accumulation_steps)
+                if self._pending_profile_timings is not None:
+                    self._merge_profile_timings(step_timings, self._pending_profile_timings)
+                    self._pending_profile_timings = None
+                with self._profile_phase(step_timings, 'policy_forward_backward_sec'):
+                    loss = self._compute_loss(inputs, mode='train', requires_grad=True)
+                    self.accelerator.backward(loss / self.config.gradient_accumulation_steps)
 
-            grad_norm = self.accelerator.clip_grad_norm_(
-                self.policy.model.backbone.parameters(),
-                self.config.max_grad_norm,
-            )
-            self.optimizer.step()
-            self.scheduler.step()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.policy.update_ema()
+            with self._profile_phase(step_timings, 'optimizer_update_sec'):
+                grad_norm = self.accelerator.clip_grad_norm_(
+                    self.policy.model.backbone.parameters(),
+                    self.config.max_grad_norm,
+                )
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.policy.update_ema()
             self.global_step += 1
             self._record_optimizer_metrics('train', grad_norm=float(grad_norm), lr=self.scheduler.get_last_lr()[0])
 
@@ -1555,15 +1679,25 @@ class GenMolCpGRPOTrainer:
             should_log = self.global_step == 1 and self.config.logging_first_step
             should_log = should_log or (self.global_step % self.config.logging_steps == 0)
             if should_log:
-                self._last_train_metrics = self._consume_logged_metrics(
-                    'train',
-                    step=self.global_step,
-                    buffer_cycle=self._buffer_metadata['buffer_cycle'],
-                )
-                self._log_metrics('train', self._last_train_metrics)
+                with self._profile_phase(step_timings, 'logging_sec'):
+                    self._last_train_metrics = self._consume_logged_metrics(
+                        'train',
+                        step=self.global_step,
+                        buffer_cycle=self._buffer_metadata['buffer_cycle'],
+                    )
+                    self._log_metrics('train', self._last_train_metrics)
 
             if self.global_step % self.config.save_steps == 0:
-                self._save_checkpoint()
+                with self._profile_phase(step_timings, 'checkpoint_sec'):
+                    self._save_checkpoint()
+
+            step_total_sec = self._stop_profile_timer(step_started_at)
+            if step_total_sec is not None:
+                self._write_step_timings(
+                    step=self.global_step,
+                    timings=step_timings,
+                    step_total_sec=step_total_sec,
+                )
 
         if self._has_pending_metrics('train'):
             self._last_train_metrics = self._consume_logged_metrics(

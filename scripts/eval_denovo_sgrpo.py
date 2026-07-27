@@ -12,6 +12,13 @@ from dataclasses import dataclass
 sys.path.append(os.path.realpath('.'))
 sys.path.append(os.path.join(os.path.realpath('.'), 'src'))
 
+from genmol.diversity import (
+    DEFAULT_DIVERSITY_METRIC,
+    MORGAN_INTERNAL_DIVERSITY,
+    RELATIVE_SCAFFOLD_DIVERSITY,
+    validate_diversity_metric,
+)
+
 
 logger = logging.getLogger(__name__)
 _PYPLOT = None
@@ -111,6 +118,7 @@ class EvalConfig:
     min_add_len: int = 60
     max_completion_length: int | None = None
     length_path: str | None = None
+    diversity_metric: str = DEFAULT_DIVERSITY_METRIC
     experiments: list[EvalExperimentConfig] | None = None
 
 
@@ -261,6 +269,9 @@ def load_config(path):
         raw['randomness_temperature_pairs'] = [EvalSweepPairConfig(**item) for item in sweep_values]
     else:
         raise ValueError(f'Unsupported sweep_axis: {sweep_axis}')
+    raw['diversity_metric'] = validate_diversity_metric(
+        raw.get('diversity_metric', DEFAULT_DIVERSITY_METRIC)
+    )
     config = EvalConfig(experiments=experiments, sweep_axis=sweep_axis, **raw)
 
     if config.num_samples <= 0:
@@ -352,6 +363,30 @@ def _display_name(experiment):
     return experiment.display_name or experiment.name
 
 
+def _diversity_display_name(metric):
+    metric = validate_diversity_metric(metric)
+    if metric == MORGAN_INTERNAL_DIVERSITY:
+        return 'Internal Diversity'
+    if metric == RELATIVE_SCAFFOLD_DIVERSITY:
+        return 'Scaffold Diversity'
+    raise AssertionError(f'Unhandled diversity metric: {metric}')
+
+
+def _diversity_description(metric):
+    metric = validate_diversity_metric(metric)
+    if metric == MORGAN_INTERNAL_DIVERSITY:
+        return (
+            '`1 - mean(pairwise Morgan-fingerprint Tanimoto similarity)` '
+            'over generated valid molecules.'
+        )
+    if metric == RELATIVE_SCAFFOLD_DIVERSITY:
+        return (
+            'the number of unique canonical Bemis-Murcko scaffolds divided '
+            'by the number of generated valid molecules.'
+        )
+    raise AssertionError(f'Unhandled diversity metric: {metric}')
+
+
 def _plot_metric_tradeoff(results, experiments, sweep_values, sweep_axis, x_key, x_label, y_key, y_label, title, output_path):
     plt = _get_pyplot()
     experiment_order = {experiment.name: idx for idx, experiment in enumerate(experiments)}
@@ -414,6 +449,7 @@ def _plot_metric_tradeoff(results, experiments, sweep_values, sweep_axis, x_key,
 
 def _build_markdown(config, results):
     sweep_values = _get_sweep_values(config)
+    diversity_name = _diversity_display_name(config.diversity_metric)
     sweep_lines = []
     if config.sweep_axis == 'randomness_temperature_pair':
         sweep_lines.extend(
@@ -443,13 +479,14 @@ def _build_markdown(config, results):
         f'- `min_add_len`: {config.min_add_len}',
         f'- `max_completion_length`: {config.max_completion_length}',
         f'- `sweep_axis`: {config.sweep_axis}',
+        f'- `diversity_metric`: {config.diversity_metric}',
         *sweep_lines,
         '',
         f'- `QED vs Diversity plot`: `{config.output_qed_diversity_plot_path}`',
         f'- `SA Score vs Diversity plot`: `{config.output_sa_score_diversity_plot_path}`',
         f'- `Soft Quality Score vs Diversity plot`: `{config.output_soft_reward_diversity_plot_path}`',
         '',
-        '| Model | Sweep Axis | Sweep Value | Generation Temperature | Randomness | Overall De Novo Score | QED | SA Score | Soft Quality Score | Internal Diversity | Valid Molecule Rate | Alert Hit Rate | Invalid Rate |',
+        f'| Model | Sweep Axis | Sweep Value | Generation Temperature | Randomness | Overall De Novo Score | QED | SA Score | Soft Quality Score | {diversity_name} | Valid Molecule Rate | Alert Hit Rate | Invalid Rate |',
         '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |',
     ]
     for row in results:
@@ -483,7 +520,7 @@ def _build_markdown(config, results):
             '- `SA Score`: mean bounded SA-derived score used by training. Higher is better.',
             '- `Soft Quality Score`: mean weighted rollout-level reward before invalid handling and alert gating. '
             'Weights come from the experiment config and default to `0.6 * QED + 0.4 * SA Score`.',
-            '- `Internal Diversity`: `1 - mean(pairwise Tanimoto similarity)` computed over all generated valid molecules for that run.',
+            f'- `{diversity_name}`: {_diversity_description(config.diversity_metric)}',
             '- `Valid Molecule Rate`: fraction of generated outputs that decode to valid molecules.',
             '- `Alert Hit Rate`: fraction of generated outputs that hit the alert rule set.',
             '- `Invalid Rate`: fraction of generated outputs that are invalid.',
@@ -500,8 +537,9 @@ def _build_markdown(config, results):
 
 
 def evaluate_model(config, experiment, device):
+    from genmol.diversity import compute_molecular_diversity
     from genmol.rl.policy import GenMolCpGRPOPolicy
-    from genmol.rl.reward import MolecularReward, compute_internal_diversity
+    from genmol.rl.reward import MolecularReward
     from genmol.rl.specs import sample_group_specs
     from genmol.rl.trainer import write_jsonl
 
@@ -574,12 +612,18 @@ def evaluate_model(config, experiment, device):
                     'sweep_label': sweep_point.sweep_label,
                     'generation_temperature': sweep_point.generation_temperature,
                     'randomness': sweep_point.randomness,
+                    'diversity_metric': config.diversity_metric,
                     'reward_mean': float(sum(rewards) / len(rewards)),
                     'qed_mean': _nanmean(qeds),
                     'sa_mean': _nanmean(sas),
                     'sa_score_mean': _nanmean(sa_scores),
                     'soft_reward_mean': _nanmean(soft_rewards),
-                    'diversity': float(compute_internal_diversity(smiles)),
+                    'diversity': float(
+                        compute_molecular_diversity(
+                            smiles,
+                            metric=config.diversity_metric,
+                        )
+                    ),
                     'valid_fraction': float(sum(valid_flags) / len(valid_flags)),
                     'alert_hit_fraction': float(sum(alert_flags) / len(alert_flags)),
                     'invalid_fraction': float(sum(invalid_flags) / len(invalid_flags)),
@@ -602,6 +646,7 @@ def evaluate_model(config, experiment, device):
                             'sweep_label': sweep_point.sweep_label,
                             'generation_temperature': sweep_point.generation_temperature,
                             'randomness': sweep_point.randomness,
+                            'diversity_metric': config.diversity_metric,
                             'reward': float(record.reward),
                             'is_valid': bool(record.is_valid),
                             'alert_hit': bool(record.alert_hit),
@@ -644,6 +689,7 @@ def main():
     experiment_order = {experiment.name: idx for idx, experiment in enumerate(config.experiments)}
     sweep_values = [point.sweep_value for point in _build_sweep_points(config)]
     sweep_order = {float(value): idx for idx, value in enumerate(sweep_values)}
+    diversity_name = _diversity_display_name(config.diversity_metric)
     results.sort(key=lambda row: (experiment_order[row['experiment']], sweep_order[float(row['sweep_value'])]))
 
     _plot_metric_tradeoff(
@@ -654,8 +700,8 @@ def main():
         x_key='qed_mean',
         x_label='QED',
         y_key='diversity',
-        y_label='Internal Diversity',
-        title='QED vs Internal Diversity',
+        y_label=diversity_name,
+        title=f'QED vs {diversity_name}',
         output_path=config.output_qed_diversity_plot_path,
     )
     _plot_metric_tradeoff(
@@ -666,8 +712,8 @@ def main():
         x_key='sa_score_mean',
         x_label='SA Score',
         y_key='diversity',
-        y_label='Internal Diversity',
-        title='SA Score vs Internal Diversity',
+        y_label=diversity_name,
+        title=f'SA Score vs {diversity_name}',
         output_path=config.output_sa_score_diversity_plot_path,
     )
     _plot_metric_tradeoff(
@@ -678,8 +724,8 @@ def main():
         x_key='soft_reward_mean',
         x_label='Soft Quality Score',
         y_key='diversity',
-        y_label='Internal Diversity',
-        title='Soft Quality Score vs Internal Diversity',
+        y_label=diversity_name,
+        title=f'Soft Quality Score vs {diversity_name}',
         output_path=config.output_soft_reward_diversity_plot_path,
     )
 

@@ -415,7 +415,10 @@ def aggregate_series(store: ResultStore, panel: PanelSpec, model: ModelSpec) -> 
 
 
 def validate_seed_independence(
-    store: ResultStore, panels: tuple[PanelSpec, ...]
+    store: ResultStore,
+    panels: tuple[PanelSpec, ...],
+    *,
+    include_denovo_auxiliary: bool = True,
 ) -> None:
     panel_models = [
         (panel, model) for panel in panels for model in panel.models
@@ -424,7 +427,7 @@ def validate_seed_independence(
         (panel for panel in panels if panel.source_kind == "denovo"),
         None,
     )
-    if denovo_panel is not None:
+    if denovo_panel is not None and include_denovo_auxiliary:
         denovo_experiments = {
             model.source_id for model in ABLATION_MODELS
         } | {
@@ -776,10 +779,7 @@ def _main_legend_handles(panels: tuple[PanelSpec, ...]) -> list[Line2D]:
         for model in panel.models:
             unique.setdefault(model.label, model)
     handles = []
-    for label in ("Original", "GRPO", "SGRPO", "Memory-Assisted GRPO"):
-        model = unique.get(label)
-        if model is None:
-            continue
+    for label, model in unique.items():
         handles.append(
             Line2D(
                 [0],

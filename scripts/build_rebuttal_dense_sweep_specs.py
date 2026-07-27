@@ -27,6 +27,7 @@ MOLECULE_SWEEP = (
     (1.0, 2.0),
 )
 PROGEN2_TEMPERATURES = tuple(round(0.1 + 0.05 * index, 2) for index in range(23))
+DENOVO_DIVERSITY_METRIC = "morgan_internal_diversity"
 
 DE_NOVO_EXPERIMENTS = (
     {
@@ -237,6 +238,7 @@ def _denovo_config(seed: int, experiment: dict, spec_root: Path) -> tuple[Path, 
         "device": "cuda",
         "num_samples": 1000,
         "generation_batch_size": 2048,
+        "diversity_metric": DENOVO_DIVERSITY_METRIC,
         "randomness_temperature_pairs": [
             {"randomness": randomness, "generation_temperature": temperature}
             for randomness, temperature in MOLECULE_SWEEP

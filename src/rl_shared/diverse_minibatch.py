@@ -247,16 +247,6 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
     import numpy as np
     from rdkit import DataStructs
 
-    try:
-        from dppy.exact_sampling import (
-            elementary_symmetric_polynomials,
-            k_dpp_eig_vecs_selector,
-        )
-    except ImportError as exc:
-        raise RuntimeError(
-            'Exact molecular k-DPP selection requires dppy==0.3.3'
-        ) from exc
-
     if size <= 0 or size > len(fingerprints):
         raise ValueError(
             f'k-DPP size must be in [1, {len(fingerprints)}], got {size}'
@@ -294,28 +284,13 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
     rank = int((eigenvalues > tolerance).sum())
     regularized = rank < size
     if regularized:
-        # L + eps*I is full rank. Scaling by 1/eps prevents underflow in the
-        # fixed-cardinality recursion and leaves the k-DPP distribution unchanged.
-        eigenvalues = (
-            eigenvalues + _DPP_DIAGONAL_JITTER
-        ) / _DPP_DIAGONAL_JITTER
+        eigenvalues = eigenvalues + _DPP_DIAGONAL_JITTER
 
     rng = np.random.RandomState(int(seed))
-    elementary_polynomials = elementary_symmetric_polynomials(
-        eigenvalues,
-        size,
-    )
-    normalizer = float(elementary_polynomials[size, -1])
-    if not np.isfinite(normalizer) or normalizer <= 0.0:
-        raise RuntimeError(
-            'Exact k-DPP eigenvector-selection normalizer is not finite and '
-            f'positive: {normalizer}'
-        )
-    projection_eigenvectors = k_dpp_eig_vecs_selector(
+    projection_eigenvectors = _sample_k_eigenvectors_logspace(
         eigenvalues,
         eigenvectors,
         size=size,
-        E_poly=elementary_polynomials,
         random_state=rng,
     )
     sample = _sample_projection_dpp_gs(
@@ -336,6 +311,110 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
         'raw_kernel_rank': float(rank),
         'regularized': float(regularized),
     }
+
+
+def _sample_k_eigenvectors_logspace(
+    eigenvalues,
+    eigenvectors,
+    *,
+    size,
+    random_state,
+):
+    """Sample the exact fixed-cardinality eigenvector set in log space."""
+    import numpy as np
+
+    values = np.asarray(eigenvalues, dtype=np.float64)
+    vectors = np.asarray(eigenvectors, dtype=np.float64)
+    if values.ndim != 1:
+        raise ValueError(f'k-DPP eigenvalues must be 1D, got {values.shape}')
+    if vectors.shape != (values.size, values.size):
+        raise ValueError(
+            'k-DPP eigenvectors must be square and match the eigenvalues: '
+            f'{vectors.shape} vs {values.shape}'
+        )
+    if size <= 0 or size > values.size:
+        raise ValueError(
+            f'k-DPP size must be in [1, {values.size}], got {size}'
+        )
+    if not np.isfinite(values).all() or float(values.min()) < 0.0:
+        raise ValueError('k-DPP eigenvalues must be finite and non-negative')
+    if not np.isfinite(vectors).all():
+        raise ValueError('k-DPP eigenvectors must all be finite')
+
+    with np.errstate(divide='ignore'):
+        log_values = np.log(values)
+    log_elementary = np.full(
+        (size + 1, values.size + 1),
+        -np.inf,
+        dtype=np.float64,
+    )
+    log_elementary[0, :] = 0.0
+    for count in range(1, values.size + 1):
+        max_order = min(size, count)
+        previous_count = count - 1
+        for order in range(1, max_order + 1):
+            log_elementary[order, count] = np.logaddexp(
+                log_elementary[order, previous_count],
+                log_values[previous_count]
+                + log_elementary[order - 1, previous_count],
+            )
+
+    log_normalizer = float(log_elementary[size, values.size])
+    if not np.isfinite(log_normalizer):
+        raise RuntimeError(
+            'Exact k-DPP has no positive finite-cardinality mass for '
+            f'size={size}'
+        )
+
+    selected = []
+    remaining = size
+    for count in range(values.size, 0, -1):
+        if remaining == 0:
+            break
+        if remaining > count:
+            raise RuntimeError(
+                'Exact k-DPP eigenvector selection reached an impossible '
+                f'state: remaining={remaining}, candidates={count}'
+            )
+        if remaining == count:
+            probability = 1.0
+        else:
+            log_numerator = (
+                log_values[count - 1]
+                + log_elementary[remaining - 1, count - 1]
+            )
+            log_denominator = log_elementary[remaining, count]
+            if not np.isfinite(log_denominator):
+                raise RuntimeError(
+                    'Exact k-DPP eigenvector selection encountered zero '
+                    f'remaining mass at size={remaining}, candidates={count}'
+                )
+            if np.isneginf(log_numerator):
+                probability = 0.0
+            else:
+                log_probability = float(log_numerator - log_denominator)
+                probability_tolerance = (
+                    np.finfo(np.float64).eps
+                    * max(1, values.size)
+                    * 100.0
+                )
+                if log_probability > probability_tolerance:
+                    raise RuntimeError(
+                        'Exact k-DPP eigenvector selection produced a '
+                        'probability greater than one: '
+                        f'log_probability={log_probability:.6g}'
+                    )
+                probability = float(np.exp(min(0.0, log_probability)))
+        if random_state.random_sample() < probability:
+            selected.append(count - 1)
+            remaining -= 1
+
+    if remaining != 0 or len(selected) != size:
+        raise RuntimeError(
+            'Exact k-DPP eigenvector selection returned the wrong '
+            f'cardinality: expected={size}, selected={len(selected)}'
+        )
+    return vectors[:, selected]
 
 
 def _sample_projection_dpp_gs(eigenvectors, *, random_state):

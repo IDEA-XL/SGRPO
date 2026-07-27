@@ -5,6 +5,7 @@ import torch
 
 from genmol.rl.cpgrpo import selective_log_softmax
 from rl_shared.diverse_minibatch import (
+    _sample_k_eigenvectors_logspace,
     _sample_projection_dpp_gs,
     optimization_group_size,
     select_molecule_groups,
@@ -109,6 +110,55 @@ class DiverseMiniBatchTest(unittest.TestCase):
         self.assertEqual(len(selection), 192)
         self.assertEqual(len(set(selection)), 192)
         self.assertTrue(all(0 <= index < 384 for index in selection))
+
+    def test_k_dpp_eigenvector_selection_handles_overflow_scale(self):
+        eigenvalues = np.full(384, 1.0e8, dtype=np.float64)
+        eigenvectors = np.eye(384, dtype=np.float64)
+
+        selection = _sample_k_eigenvectors_logspace(
+            eigenvalues,
+            eigenvectors,
+            size=192,
+            random_state=np.random.RandomState(29),
+        )
+
+        self.assertEqual(selection.shape, (384, 192))
+        selected_indices = np.argmax(selection, axis=0)
+        self.assertEqual(len(set(selected_indices.tolist())), 192)
+        self.assertTrue(
+            np.allclose(
+                selection.T @ selection,
+                np.eye(192, dtype=np.float64),
+            )
+        )
+
+    def test_k_dpp_eigenvector_selection_matches_exact_distribution(self):
+        eigenvalues = np.array([1.0, 2.0, 4.0], dtype=np.float64)
+        eigenvectors = np.eye(3, dtype=np.float64)
+        counts = {(0, 1): 0, (0, 2): 0, (1, 2): 0}
+        trials = 6000
+
+        for seed in range(trials):
+            selection = _sample_k_eigenvectors_logspace(
+                eigenvalues,
+                eigenvectors,
+                size=2,
+                random_state=np.random.RandomState(seed),
+            )
+            selected = tuple(sorted(np.argmax(selection, axis=0).tolist()))
+            counts[selected] += 1
+
+        expected = {
+            (0, 1): 2.0 / 14.0,
+            (0, 2): 4.0 / 14.0,
+            (1, 2): 8.0 / 14.0,
+        }
+        for selected, probability in expected.items():
+            self.assertAlmostEqual(
+                counts[selected] / trials,
+                probability,
+                delta=0.02,
+            )
 
     def test_sequence_maxmin_selects_fixed_batch_without_validity_filtering(self):
         selection = select_sequence_groups(

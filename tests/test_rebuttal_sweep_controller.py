@@ -163,6 +163,78 @@ class RebuttalSweepControllerTest(unittest.TestCase):
             (checkpoint / "trainer_state.pt").write_bytes(b"state")
             self.assertTrue(controller._progen2_checkpoint_ready(checkpoint))
 
+    def test_point_reward_validator_matches_only_valid_generation_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation_path = root / "generation.jsonl"
+            reward_path = root / "developability.jsonl"
+            generation_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {"sample_index": 0, "is_valid": True},
+                        {"sample_index": 1, "is_valid": False},
+                        {"sample_index": 2, "is_valid": True},
+                    )
+                )
+            )
+            reward_path.write_text(
+                "\n".join(
+                    json.dumps(row)
+                    for row in (
+                        {"sample_index": 0, "developability": 0.8},
+                        {"sample_index": 2, "developability": 0.6},
+                    )
+                )
+            )
+
+            self.assertTrue(
+                controller._point_reward_output_valid(
+                    generation_path,
+                    reward_path,
+                    "developability",
+                    expected_generation_rows=3,
+                )
+            )
+
+            reward_path.write_text(
+                json.dumps(
+                    {"sample_index": 0, "developability": 0.8}
+                )
+            )
+            self.assertFalse(
+                controller._point_reward_output_valid(
+                    generation_path,
+                    reward_path,
+                    "developability",
+                    expected_generation_rows=3,
+                )
+            )
+
+    def test_point_reward_validator_accepts_empty_output_when_all_invalid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            generation_path = root / "generation.jsonl"
+            reward_path = root / "foldability.jsonl"
+            generation_path.write_text(
+                "\n".join(
+                    json.dumps(
+                        {"sample_index": index, "is_valid": False}
+                    )
+                    for index in range(3)
+                )
+            )
+            reward_path.write_text("")
+
+            self.assertTrue(
+                controller._point_reward_output_valid(
+                    generation_path,
+                    reward_path,
+                    "foldability",
+                    expected_generation_rows=3,
+                )
+            )
+
     def test_gpu_task_selection_starts_from_persisted_cursor(self):
         groups = {
             name: controller.GroupSpec(

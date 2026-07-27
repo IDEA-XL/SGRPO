@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import fcntl
 import json
+import math
 import os
 import subprocess
 import time
@@ -110,6 +111,70 @@ def _jsonl_has_rows(path: Path, expected: int) -> bool:
     except OSError:
         return False
     return count == expected
+
+
+def _point_reward_output_valid(
+    generation_path: Path,
+    reward_path: Path,
+    reward_name: str,
+    *,
+    expected_generation_rows: int = 512,
+) -> bool:
+    if reward_name not in {"foldability", "developability"}:
+        raise ValueError(f"Unsupported point reward: {reward_name!r}")
+    if not generation_path.is_file() or not reward_path.is_file():
+        return False
+    try:
+        generation_rows = [
+            json.loads(line)
+            for line in generation_path.read_text().splitlines()
+            if line.strip()
+        ]
+        reward_rows = [
+            json.loads(line)
+            for line in reward_path.read_text().splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError):
+        return False
+    if len(generation_rows) != expected_generation_rows:
+        return False
+
+    generation_indices = set()
+    expected_reward_indices = set()
+    for row in generation_rows:
+        if not isinstance(row, dict):
+            return False
+        sample_index = row.get("sample_index")
+        if (
+            isinstance(sample_index, bool)
+            or not isinstance(sample_index, int)
+            or sample_index < 0
+            or sample_index in generation_indices
+            or not isinstance(row.get("is_valid"), bool)
+        ):
+            return False
+        generation_indices.add(sample_index)
+        if row["is_valid"]:
+            expected_reward_indices.add(sample_index)
+
+    actual_reward_indices = set()
+    for row in reward_rows:
+        if not isinstance(row, dict):
+            return False
+        sample_index = row.get("sample_index")
+        reward_value = row.get(reward_name)
+        if (
+            isinstance(sample_index, bool)
+            or not isinstance(sample_index, int)
+            or sample_index in actual_reward_indices
+            or isinstance(reward_value, bool)
+            or not isinstance(reward_value, (int, float))
+            or not math.isfinite(float(reward_value))
+        ):
+            return False
+        actual_reward_indices.add(sample_index)
+    return actual_reward_indices == expected_reward_indices
 
 
 def _nonempty_file(path: Path) -> bool:
@@ -673,9 +738,15 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                     group=foldability_group,
                     array_id=task_id,
                     prerequisites=(generation_key,),
-                    validator=lambda path=Path(
+                    validator=lambda generation_path=Path(
+                        row["generation_rows_path"]
+                    ), reward_path=Path(
                         row["foldability_scores_path"]
-                    ): _jsonl_has_rows(path, 512),
+                    ): _point_reward_output_valid(
+                        generation_path,
+                        reward_path,
+                        "foldability",
+                    ),
                 ),
             )
             _add_task(
@@ -685,9 +756,15 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                     group=developability_group,
                     array_id=task_id,
                     prerequisites=(generation_key,),
-                    validator=lambda path=Path(
+                    validator=lambda generation_path=Path(
+                        row["generation_rows_path"]
+                    ), reward_path=Path(
                         row["developability_scores_path"]
-                    ): _jsonl_has_rows(path, 512),
+                    ): _point_reward_output_valid(
+                        generation_path,
+                        reward_path,
+                        "developability",
+                    ),
                 ),
             )
             _add_task(

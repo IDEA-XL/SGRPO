@@ -11,7 +11,6 @@ import matplotlib.pyplot as plt
 
 
 SCAFFOLD_DIVERSITY_METRIC = "relative_scaffold_diversity"
-COLOR_DMB = "#6B5B95"
 COLOR_ENTROPY = "#C85A3E"
 SECTION_BEGIN = "<!-- BEGIN DENOVO SCAFFOLD DIVERSITY RESULTS -->"
 SECTION_END = "<!-- END DENOVO SCAFFOLD DIVERSITY RESULTS -->"
@@ -23,18 +22,6 @@ PANEL = dense.PanelSpec(
     models=(
         dense.ModelSpec("scaffold_original_genmol_v2", "Original", dense.COLOR_ORIGINAL, "D"),
         dense.ModelSpec("scaffold_grpo_2000", "GRPO", dense.COLOR_GRPO, "^"),
-        dense.ModelSpec(
-            "scaffold_hbd_2000",
-            "Memory-Assisted GRPO",
-            dense.COLOR_MEMORY,
-            "s",
-        ),
-        dense.ModelSpec(
-            "scaffold_dmb_2000",
-            "Diverse Mini-Batch GRPO",
-            COLOR_DMB,
-            "P",
-        ),
         dense.ModelSpec(
             "scaffold_entropy_2000",
             "Entropy-Regularized GRPO",
@@ -112,7 +99,7 @@ def _result_section(
     lines = [
         "## GenMol De Novo: Scaffold Diversity",
         "",
-        "All six models are evaluated with relative Bemis-Murcko scaffold diversity. "
+        "All four models are evaluated with relative Bemis-Murcko scaffold diversity. "
         "Each operating point reports the mean and 95% confidence interval over "
         "five independent generation runs.",
         "",

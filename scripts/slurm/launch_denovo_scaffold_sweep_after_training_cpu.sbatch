@@ -10,11 +10,7 @@
 
 set -euo pipefail
 
-: "${GRPO_JOB_ID:?GRPO_JOB_ID is required}"
-: "${HBD_JOB_ID:?HBD_JOB_ID is required}"
 : "${SGRPO_JOB_ID:?SGRPO_JOB_ID is required}"
-: "${DMB_JOB_ID:?DMB_JOB_ID is required}"
-: "${ENTROPY_JOB_ID:?ENTROPY_JOB_ID is required}"
 
 REPO_DIR=/public/home/xinwuye/ai4s-tool-joint-train/genmol
 
@@ -24,8 +20,4 @@ export PATH=/opt/gridview/slurm/bin:${PATH}
 
 cd "${REPO_DIR}"
 python -u scripts/launch_denovo_scaffold_sweep.py \
-  --grpo-job-id "${GRPO_JOB_ID}" \
-  --hbd-job-id "${HBD_JOB_ID}" \
-  --sgrpo-job-id "${SGRPO_JOB_ID}" \
-  --dmb-job-id "${DMB_JOB_ID}" \
-  --entropy-job-id "${ENTROPY_JOB_ID}"
+  --sgrpo-job-id "${SGRPO_JOB_ID}"

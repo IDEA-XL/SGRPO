@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve five completed training jobs and launch the scaffold sweep DAG."""
+"""Resolve the scaffold-SGRPO checkpoint and launch the scaffold sweep DAG."""
 
 from __future__ import annotations
 
@@ -17,26 +17,28 @@ SWEEP_ROOT = RUNS_ROOT / "denovo_scaffold_sweep"
 SBATCH = Path("/opt/gridview/slurm/bin/sbatch")
 SACCT = Path("/opt/gridview/slurm/bin/sacct")
 
-CONFIG_STEMS = {
+SGRPO_CONFIG_STEM = (
+    "cpgrpo_denovo_scaffold_sgrpo_ng64_sg8_bs2048_lr5e-5_beta5e-3_"
+    "gw09_rewardsum_loo_gc_ms2000_stl0"
+)
+REUSED_CHECKPOINTS = {
     "grpo": (
-        "cpgrpo_denovo_scaffold_grpo_ng512_bs2048_lr5e-5_beta5e-3_"
-        "ni1_gc_ms2000_stl0"
-    ),
-    "hbd": (
-        "cpgrpo_denovo_scaffold_hbd_ng512_bs2048_lr5e-5_beta5e-3_"
-        "ni1_gc_st09_sc04_ms2000_stl0"
-    ),
-    "sgrpo": (
-        "cpgrpo_denovo_scaffold_sgrpo_ng64_sg8_bs2048_lr5e-5_beta5e-3_"
-        "gw09_rewardsum_loo_gc_ms2000_stl0"
-    ),
-    "dmb": (
-        "cpgrpo_denovo_scaffold_dmb_ng1024_bs2048_lr5e-5_beta5e-3_"
-        "ni1_gc_ms2000_stl0"
+        RUNS_ROOT
+        / "cpgrpo_denovo"
+        / (
+            "cpgrpo_denovo_ng512_bs1024_lr5e-5_beta5e-3_ni1_"
+            "ms2000_20260422_161812"
+        )
+        / "checkpoint-002000/model.ckpt"
     ),
     "entropy": (
-        "cpgrpo_denovo_scaffold_entropy001_ng512_bs2048_lr5e-5_beta5e-3_"
-        "ni1_gc_ms2000_stl0"
+        RUNS_ROOT
+        / "cpgrpo_denovo"
+        / (
+            "cpgrpo_denovo_entropy001_ng512_bs1024_lr5e-5_beta5e-3_"
+            "ni1_ms2000_stl0_20260726_155242"
+        )
+        / "checkpoint-002000/model.ckpt"
     ),
 }
 
@@ -53,18 +55,11 @@ def _positive_job_id(value: str) -> int:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    for name in CONFIG_STEMS:
-        parser.add_argument(
-            f"--{name}-job-id",
-            type=_positive_job_id,
-            required=True,
-        )
+    parser.add_argument("--sgrpo-job-id", type=_positive_job_id, required=True)
     return parser.parse_args()
 
 
-def _require_completed_jobs(job_ids: dict[str, int]) -> None:
-    if len(set(job_ids.values())) != len(job_ids):
-        raise ValueError(f"Training job IDs must be distinct: {job_ids}")
+def _require_completed_job(job_id: int) -> None:
     result = subprocess.run(
         [
             str(SACCT),
@@ -72,49 +67,52 @@ def _require_completed_jobs(job_ids: dict[str, int]) -> None:
             "-n",
             "-P",
             "-j",
-            ",".join(str(job_id) for job_id in job_ids.values()),
+            str(job_id),
             "--format=JobIDRaw,State,ExitCode",
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    states = {}
-    expected = {str(job_id) for job_id in job_ids.values()}
+    state = None
     for line in result.stdout.splitlines():
         if not line.strip():
             continue
-        job_id, state, exit_code = line.split("|", 2)
-        if job_id in expected:
-            states[job_id] = (state.split()[0].rstrip("+"), exit_code)
-    failures = {
-        name: states.get(str(job_id))
-        for name, job_id in job_ids.items()
-        if states.get(str(job_id)) != ("COMPLETED", "0:0")
-    }
-    if failures:
-        raise RuntimeError(f"Scaffold training jobs are not all complete: {failures}")
+        record_job_id, record_state, exit_code = line.split("|", 2)
+        if record_job_id == str(job_id):
+            state = (record_state.split()[0].rstrip("+"), exit_code)
+    if state != ("COMPLETED", "0:0"):
+        raise RuntimeError(
+            f"Scaffold SGRPO training job {job_id} is not complete: {state}"
+        )
 
 
-def _resolve_checkpoint(name: str, job_id: int) -> Path:
-    run_dir = (
-        RUNS_ROOT
-        / "cpgrpo_denovo"
-        / f"{CONFIG_STEMS[name]}_slurm{job_id}"
-    )
-    checkpoint = run_dir / "checkpoint-002000/model.ckpt"
+def _validate_checkpoint(checkpoint: Path, label: str) -> Path:
+    run_dir = checkpoint.parents[1]
     required = (
         checkpoint,
-        run_dir / "checkpoint-002000/trainer_state.json",
+        checkpoint.parent / "trainer_state.json",
         run_dir / "train_results.json",
     )
-    missing = [path for path in required if not path.is_file() or path.stat().st_size == 0]
+    missing = [
+        path for path in required if not path.is_file() or path.stat().st_size == 0
+    ]
     if missing:
         raise FileNotFoundError(
-            f"Incomplete final checkpoint for {name} job {job_id}:\n"
+            f"Incomplete final checkpoint for {label}:\n"
             + "\n".join(str(path) for path in missing)
         )
     return checkpoint
+
+
+def _resolve_sgrpo_checkpoint(job_id: int) -> Path:
+    run_dir = (
+        RUNS_ROOT
+        / "cpgrpo_denovo"
+        / f"{SGRPO_CONFIG_STEM}_slurm{job_id}"
+    )
+    checkpoint = run_dir / "checkpoint-002000/model.ckpt"
+    return _validate_checkpoint(checkpoint, f"scaffold SGRPO job {job_id}")
 
 
 def _submit(script: Path, *options: str) -> str:
@@ -147,15 +145,12 @@ def main() -> None:
             f"Sweep root already exists; refusing to mix results: {SWEEP_ROOT}"
         )
 
-    job_ids = {
-        name: int(getattr(args, f"{name}_job_id"))
-        for name in CONFIG_STEMS
-    }
-    _require_completed_jobs(job_ids)
+    _require_completed_job(args.sgrpo_job_id)
     checkpoints = {
-        name: _resolve_checkpoint(name, job_id)
-        for name, job_id in job_ids.items()
+        name: _validate_checkpoint(path, f"reused {name}")
+        for name, path in REUSED_CHECKPOINTS.items()
     }
+    checkpoints["sgrpo"] = _resolve_sgrpo_checkpoint(args.sgrpo_job_id)
 
     build_command = [
         sys.executable,
@@ -177,7 +172,7 @@ def main() -> None:
     )
     manifest = {
         "submitted_at": datetime.now(timezone.utc).isoformat(),
-        "training_job_ids": job_ids,
+        "training_job_ids": {"sgrpo": args.sgrpo_job_id},
         "checkpoints": {name: str(path) for name, path in checkpoints.items()},
         "controller_job_id": controller_job_id,
         "render_job_id": render_job_id,

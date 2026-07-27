@@ -27,9 +27,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
     parser.add_argument("--grpo-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--hbd-checkpoint", type=_checkpoint_file, required=True)
     parser.add_argument("--sgrpo-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--dmb-checkpoint", type=_checkpoint_file, required=True)
     parser.add_argument("--entropy-checkpoint", type=_checkpoint_file, required=True)
     return parser.parse_args()
 
@@ -59,18 +57,6 @@ def main() -> None:
             "name": "scaffold_grpo_2000",
             "display_name": "GRPO",
             "checkpoint_path": args.grpo_checkpoint,
-        },
-        {
-            "category": "scaffold",
-            "name": "scaffold_hbd_2000",
-            "display_name": "Memory-Assisted GRPO",
-            "checkpoint_path": args.hbd_checkpoint,
-        },
-        {
-            "category": "scaffold",
-            "name": "scaffold_dmb_2000",
-            "display_name": "Diverse Mini-Batch GRPO",
-            "checkpoint_path": args.dmb_checkpoint,
         },
         {
             "category": "scaffold",

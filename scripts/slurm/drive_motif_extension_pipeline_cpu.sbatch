@@ -3,7 +3,7 @@
 #SBATCH -N 1
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
-#SBATCH -t 7-00:00:00
+#SBATCH -t 5-00:00:00
 #SBATCH --exclude=server13,server46,server59
 #SBATCH -J motif_driver
 #SBATCH -o /public/home/xinwuye/ai4s-tool-joint-train/runs/motif_extension/logs/controller_%j.out

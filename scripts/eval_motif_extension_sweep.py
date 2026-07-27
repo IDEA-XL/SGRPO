@@ -137,7 +137,9 @@ def evaluate(spec: dict) -> None:
                     policy.motif_base_sequence_length(motif.smiles)
                     for motif in expanded_motifs
                 ]
-                point_seed = spec["seed"] + point_index * 100_000
+                # Reuse the seed across paired sweep points, matching the
+                # existing GenMol sweep's common-random-number evaluation.
+                point_seed = spec["seed"]
                 specs = sample_conditioned_group_specs(
                     base_sequence_lengths=base_lengths,
                     generation_temperature=temperature,

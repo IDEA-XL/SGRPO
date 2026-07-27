@@ -116,6 +116,46 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
                     allow_partial_tail=True,
                 )
 
+    def test_validated_completed_job_ignores_historical_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stderr_path = Path(directory) / 'job.err'
+            stderr_path.write_text('Traceback (most recent call last):\n')
+            record = {
+                'state': 'COMPLETED',
+                'exit_code': '0:0',
+                'stdout': '',
+                'stderr': str(stderr_path),
+            }
+            metrics = {'max_step': 2000}
+
+            errors = monitor._actionable_log_errors(
+                record,
+                metrics,
+                self._entropy_spec(Path(directory) / 'metrics.jsonl'),
+            )
+
+        self.assertEqual(errors, [])
+
+    def test_running_job_reports_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stderr_path = Path(directory) / 'job.err'
+            stderr_path.write_text('Traceback (most recent call last):\n')
+            record = {
+                'state': 'RUNNING',
+                'exit_code': '0:0',
+                'stdout': '',
+                'stderr': str(stderr_path),
+            }
+            metrics = {'max_step': 100}
+
+            errors = monitor._actionable_log_errors(
+                record,
+                metrics,
+                self._entropy_spec(Path(directory) / 'metrics.jsonl'),
+            )
+
+        self.assertEqual(errors, [r'Traceback \(most recent call last\)'])
+
     def test_dmb_valid_candidate_shortfall_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'

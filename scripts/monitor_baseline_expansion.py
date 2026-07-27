@@ -437,6 +437,19 @@ def _log_errors(record: dict) -> list[str]:
     ]
 
 
+def _actionable_log_errors(
+    record: dict,
+    metrics: dict,
+    spec: JobSpec,
+) -> list[str]:
+    output_is_complete = (
+        record["state"] == "COMPLETED"
+        and record["exit_code"] == "0:0"
+        and metrics["max_step"] == spec.expected_final_step
+    )
+    return [] if output_is_complete else _log_errors(record)
+
+
 def _build_specs(args: argparse.Namespace) -> list[JobSpec]:
     specs = []
     job_ids = []
@@ -543,7 +556,7 @@ def _poll(
                 f"VERIFIED {spec.name} first_ten_steps",
             )
 
-        errors = _log_errors(record)
+        errors = _actionable_log_errors(record, metrics, spec)
         if errors:
             _record_alert(
                 runtime,

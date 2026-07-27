@@ -1,9 +1,11 @@
 import unittest
 
+import numpy as np
 import torch
 
 from genmol.rl.cpgrpo import selective_log_softmax
 from rl_shared.diverse_minibatch import (
+    _sample_projection_dpp_gs,
     optimization_group_size,
     select_molecule_groups,
     select_sequence_groups,
@@ -81,6 +83,20 @@ class DiverseMiniBatchTest(unittest.TestCase):
             selection.metrics['regularized_dpp_group_count'],
             1.0,
         )
+
+    def test_projection_dpp_stably_samples_large_fixed_cardinality(self):
+        random = np.random.RandomState(17)
+        matrix = random.standard_normal((384, 192))
+        eigenvectors, _ = np.linalg.qr(matrix, mode='reduced')
+
+        selection = _sample_projection_dpp_gs(
+            eigenvectors,
+            random_state=np.random.RandomState(23),
+        )
+
+        self.assertEqual(len(selection), 192)
+        self.assertEqual(len(set(selection)), 192)
+        self.assertTrue(all(0 <= index < 384 for index in selection))
 
     def test_sequence_maxmin_selects_fixed_batch_without_validity_filtering(self):
         selection = select_sequence_groups(

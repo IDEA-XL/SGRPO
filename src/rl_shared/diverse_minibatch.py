@@ -246,7 +246,10 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
     from rdkit import DataStructs
 
     try:
-        from dppy.finite_dpps import FiniteDPP
+        from dppy.exact_sampling import (
+            elementary_symmetric_polynomials,
+            k_dpp_eig_vecs_selector,
+        )
     except ImportError as exc:
         raise RuntimeError(
             'Exact molecular k-DPP selection requires dppy==0.3.3'
@@ -295,14 +298,27 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
             eigenvalues + _DPP_DIAGONAL_JITTER
         ) / _DPP_DIAGONAL_JITTER
 
-    dpp = FiniteDPP(
-        'likelihood',
-        **{'L_eig_dec': (eigenvalues, eigenvectors)},
+    rng = np.random.RandomState(int(seed))
+    elementary_polynomials = elementary_symmetric_polynomials(
+        eigenvalues,
+        size,
     )
-    sample = dpp.sample_exact_k_dpp(
+    normalizer = float(elementary_polynomials[size, -1])
+    if not np.isfinite(normalizer) or normalizer <= 0.0:
+        raise RuntimeError(
+            'Exact k-DPP eigenvector-selection normalizer is not finite and '
+            f'positive: {normalizer}'
+        )
+    projection_eigenvectors = k_dpp_eig_vecs_selector(
+        eigenvalues,
+        eigenvectors,
         size=size,
-        mode='GS',
-        random_state=np.random.RandomState(int(seed)),
+        E_poly=elementary_polynomials,
+        random_state=rng,
+    )
+    sample = _sample_projection_dpp_gs(
+        projection_eigenvectors,
+        random_state=rng,
     )
     eigensample_sec = time.perf_counter() - eigensample_started
     picks = [int(idx) for idx in sample]
@@ -318,6 +334,102 @@ def _sample_exact_tanimoto_k_dpp(fingerprints, *, size, seed):
         'raw_kernel_rank': float(rank),
         'regularized': float(regularized),
     }
+
+
+def _sample_projection_dpp_gs(eigenvectors, *, random_state):
+    """Sample a projection DPP with numerically normalized GS probabilities."""
+    import numpy as np
+
+    vectors = np.asarray(eigenvectors, dtype=np.float64)
+    if vectors.ndim != 2 or vectors.shape[1] <= 0:
+        raise ValueError(
+            'Projection-DPP eigenvectors must be a non-empty matrix, got '
+            f'{vectors.shape}'
+        )
+    if not np.isfinite(vectors).all():
+        raise ValueError('Projection-DPP eigenvectors must all be finite')
+
+    ground_size, rank = vectors.shape
+    gram_error = float(
+        np.max(np.abs(vectors.T @ vectors - np.eye(rank)))
+    )
+    orthogonality_tolerance = (
+        np.finfo(np.float64).eps
+        * max(1, ground_size, rank)
+        * 1000.0
+    )
+    if gram_error > orthogonality_tolerance:
+        raise RuntimeError(
+            'Projection-DPP eigenvectors are not orthonormal within numerical '
+            f'tolerance: error={gram_error:.6g}, '
+            f'tolerance={orthogonality_tolerance:.6g}'
+        )
+
+    available = np.ones(ground_size, dtype=bool)
+    contributions = np.zeros((ground_size, rank), dtype=np.float64)
+    residual_norms = np.einsum('ij,ij->i', vectors, vectors)
+    selected = []
+    negative_tolerance = orthogonality_tolerance
+
+    for iteration in range(rank):
+        available_indices = np.flatnonzero(available)
+        weights = residual_norms[available_indices]
+        minimum_weight = float(weights.min())
+        if minimum_weight < -negative_tolerance:
+            raise RuntimeError(
+                'Projection-DPP Gram-Schmidt produced a materially negative '
+                f'residual norm at iteration {iteration}: {minimum_weight:.6g}'
+            )
+        weights = np.maximum(weights, 0.0)
+        total_weight = float(weights.sum())
+        if not np.isfinite(total_weight) or total_weight <= 0.0:
+            raise RuntimeError(
+                'Projection-DPP Gram-Schmidt has no positive finite sampling '
+                f'mass at iteration {iteration}: {total_weight}'
+            )
+        probabilities = weights / total_weight
+        correction_index = int(np.argmax(probabilities))
+        probabilities[correction_index] += 1.0 - float(probabilities.sum())
+        if (
+            not np.isfinite(probabilities).all()
+            or float(probabilities.min()) < 0.0
+        ):
+            raise RuntimeError(
+                'Projection-DPP Gram-Schmidt produced invalid probabilities '
+                f'at iteration {iteration}'
+            )
+
+        selected_index = int(
+            random_state.choice(available_indices, p=probabilities)
+        )
+        selected.append(selected_index)
+        if iteration == rank - 1:
+            break
+
+        selected_norm = float(residual_norms[selected_index])
+        if selected_norm <= 0.0 or not np.isfinite(selected_norm):
+            raise RuntimeError(
+                'Projection-DPP selected an item with non-positive residual '
+                f'norm at iteration {iteration}: {selected_norm}'
+            )
+        available[selected_index] = False
+        remaining = np.flatnonzero(available)
+        contributions[remaining, iteration] = (
+            vectors[remaining] @ vectors[selected_index]
+            - contributions[remaining, :iteration]
+            @ contributions[selected_index, :iteration]
+        ) / np.sqrt(selected_norm)
+        residual_norms[remaining] -= (
+            contributions[remaining, iteration] ** 2
+        )
+        residual_norms[selected_index] = 0.0
+
+    if len(selected) != rank or len(set(selected)) != rank:
+        raise RuntimeError(
+            'Projection-DPP Gram-Schmidt returned an invalid sample: '
+            f'{len(selected)} entries, {len(set(selected))} unique'
+        )
+    return selected
 
 
 def _maxmin_edit_distance_selection(sequences, *, size, seed):

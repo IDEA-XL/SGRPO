@@ -57,6 +57,7 @@ class JobSpec:
     expected_final_step: int
     expected_candidate_count: int | None = None
     expected_selected_count: int | None = None
+    selection_includes_invalid_candidates: bool = False
 
 
 JOB_TEMPLATES = {
@@ -123,6 +124,7 @@ JOB_TEMPLATES = {
         "expected_final_step": 100,
         "expected_candidate_count": 384,
         "expected_selected_count": 192,
+        "selection_includes_invalid_candidates": True,
     },
     "progen2_entropy": {
         "metrics_glob": str(
@@ -380,7 +382,57 @@ def _read_metrics(
                     f"{context} has invalid valid_candidate_count="
                     f"{valid_candidate_count} for candidate_count={candidate_count}"
                 )
-            if (
+            if spec.selection_includes_invalid_candidates:
+                selected_valid_count = _finite_metric(
+                    row,
+                    "diverse_minibatch/selected_valid_count",
+                    context=context,
+                )
+                selected_invalid_count = _finite_metric(
+                    row,
+                    "diverse_minibatch/selected_invalid_count",
+                    context=context,
+                )
+                if not math.isclose(
+                    selected_count,
+                    target_count,
+                    rel_tol=1.0e-6,
+                    abs_tol=1.0e-4,
+                ):
+                    raise RuntimeError(
+                        f"{context} selected_count={selected_count}, expected fixed "
+                        f"target_count={target_count}"
+                    )
+                if (
+                    selected_valid_count < 0.0
+                    or selected_valid_count
+                    > min(valid_candidate_count, selected_count) + 1.0e-4
+                ):
+                    raise RuntimeError(
+                        f"{context} has invalid selected_valid_count="
+                        f"{selected_valid_count}"
+                    )
+                if (
+                    selected_invalid_count < 0.0
+                    or selected_invalid_count
+                    > candidate_count - valid_candidate_count + 1.0e-4
+                    or not math.isclose(
+                        selected_invalid_count,
+                        selected_count - selected_valid_count,
+                        rel_tol=1.0e-6,
+                        abs_tol=1.0e-4,
+                    )
+                ):
+                    raise RuntimeError(
+                        f"{context} has inconsistent selected_invalid_count="
+                        f"{selected_invalid_count}"
+                    )
+                if selected_valid_count <= 0.0:
+                    raise RuntimeError(
+                        f"{context} has no valid selected candidates and therefore "
+                        "no validity-correcting GRPO signal"
+                    )
+            elif (
                 selected_count < 0.0
                 or selected_count
                 > min(valid_candidate_count, target_count) + 1.0e-4
@@ -468,6 +520,10 @@ def _build_specs(args: argparse.Namespace) -> list[JobSpec]:
                 ),
                 expected_selected_count=template.get(
                     "expected_selected_count"
+                ),
+                selection_includes_invalid_candidates=template.get(
+                    "selection_includes_invalid_candidates",
+                    False,
                 ),
             )
         )

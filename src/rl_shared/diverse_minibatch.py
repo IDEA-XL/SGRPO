@@ -191,40 +191,32 @@ def select_sequence_groups(
     selected_indices = []
     active_mask = []
     valid_count = 0
+    selected_valid_count = 0
     distance_sec = 0.0
 
     for group_idx, group in enumerate(groups):
-        group_valid_indices = [
-            idx for idx, sequence in enumerate(group)
-            if is_valid_protein_sequence(sequence)
+        normalized_sequences = [
+            normalize_protein_sequence(sequence)
+            for sequence in group
         ]
-        valid_count += len(group_valid_indices)
-        if not group_valid_indices:
-            group_picks = []
-        elif len(group_valid_indices) <= selected_size:
-            group_picks = list(range(len(group_valid_indices)))
-        else:
-            valid_sequences = [
-                normalize_protein_sequence(group[idx])
-                for idx in group_valid_indices
-            ]
-            distance_started = time.perf_counter()
-            group_picks = _maxmin_edit_distance_selection(
-                valid_sequences,
-                size=selected_size,
-                seed=int(seed) + group_idx,
-            )
-            distance_sec += time.perf_counter() - distance_started
-
-        original_group_picks = sorted(group_valid_indices[idx] for idx in group_picks)
-        padded_picks, group_mask = _pad_group_selection(
-            original_group_picks,
-            selected_size=selected_size,
-            empty_fallback_index=0,
+        group_valid_flags = [
+            is_valid_protein_sequence(sequence)
+            for sequence in group
+        ]
+        valid_count += sum(group_valid_flags)
+        distance_started = time.perf_counter()
+        group_picks = _maxmin_edit_distance_selection(
+            normalized_sequences,
+            size=selected_size,
+            seed=int(seed) + group_idx,
         )
+        distance_sec += time.perf_counter() - distance_started
+        group_picks = sorted(group_picks)
+        selected_valid_count += sum(group_valid_flags[idx] for idx in group_picks)
+
         group_offset = group_idx * candidate_size
-        selected_indices.extend(group_offset + idx for idx in padded_picks)
-        active_mask.extend(group_mask)
+        selected_indices.extend(group_offset + idx for idx in group_picks)
+        active_mask.extend([True] * selected_size)
 
     selected_count = sum(active_mask)
     metrics = _selection_metrics(
@@ -235,6 +227,13 @@ def select_sequence_groups(
         elapsed=time.perf_counter() - started,
     )
     metrics['distance_and_maxmin_sec'] = float(distance_sec)
+    metrics['selected_valid_count'] = float(selected_valid_count)
+    metrics['selected_valid_fraction'] = float(
+        selected_valid_count / selected_count
+    )
+    metrics['selected_invalid_count'] = float(
+        selected_count - selected_valid_count
+    )
     return DiverseMiniBatchSelection(
         indices=tuple(selected_indices),
         active_mask=tuple(active_mask),

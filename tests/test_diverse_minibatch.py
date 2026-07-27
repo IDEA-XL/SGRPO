@@ -82,29 +82,59 @@ class DiverseMiniBatchTest(unittest.TestCase):
             1.0,
         )
 
-    def test_sequence_maxmin_shortfall_masks_padding(self):
+    def test_sequence_maxmin_selects_fixed_batch_without_validity_filtering(self):
         selection = select_sequence_groups(
             ['ACDE', '', 'AX', 'WYYY'],
             candidate_size=4,
             selected_size=3,
             seed=5,
         )
-        self.assertEqual(sum(selection.active_mask), 2)
+        self.assertEqual(selection.active_mask, (True, True, True))
         self.assertEqual(len(selection.indices), 3)
-        self.assertEqual(selection.metrics['shortfall_count'], 1.0)
+        self.assertEqual(len(set(selection.indices)), 3)
+        self.assertEqual(selection.metrics['valid_candidate_count'], 2.0)
+        self.assertEqual(selection.metrics['selected_count'], 3.0)
+        self.assertEqual(selection.metrics['shortfall_count'], 0.0)
+        self.assertGreater(selection.metrics['selected_invalid_count'], 0.0)
 
-    def test_sequence_empty_group_preserves_shape_and_masks_all_padding(self):
+    def test_sequence_all_invalid_group_keeps_fixed_active_batch(self):
         selection = select_sequence_groups(
             ['', 'AX', None, ''],
             candidate_size=4,
             selected_size=3,
             seed=5,
         )
-        self.assertEqual(selection.indices, (0, 0, 0))
-        self.assertEqual(selection.active_mask, (False, False, False))
+        self.assertEqual(len(selection.indices), 3)
+        self.assertEqual(len(set(selection.indices)), 3)
+        self.assertEqual(selection.active_mask, (True, True, True))
         self.assertEqual(selection.metrics['valid_candidate_count'], 0.0)
-        self.assertEqual(selection.metrics['selected_count'], 0.0)
-        self.assertEqual(selection.metrics['shortfall_count'], 3.0)
+        self.assertEqual(selection.metrics['selected_valid_count'], 0.0)
+        self.assertEqual(selection.metrics['selected_invalid_count'], 3.0)
+        self.assertEqual(selection.metrics['selected_count'], 3.0)
+        self.assertEqual(selection.metrics['shortfall_count'], 0.0)
+
+    def test_selected_invalid_reward_receives_negative_group_advantage(self):
+        selection = select_sequence_groups(
+            ['ACDE', '', 'AX', 'WYYY'],
+            candidate_size=4,
+            selected_size=3,
+            seed=5,
+        )
+        rewards = torch.tensor([
+            1.0 if index in (0, 3) else 0.0
+            for index in selection.indices
+        ])
+        advantages, _, _ = compute_grouped_advantages(
+            rewards,
+            num_generations=3,
+        )
+        invalid_positions = [
+            position
+            for position, index in enumerate(selection.indices)
+            if index not in (0, 3)
+        ]
+        self.assertTrue(invalid_positions)
+        self.assertTrue(torch.all(advantages[invalid_positions] < 0.0))
 
     def test_masked_grouped_advantages_ignore_padding(self):
         rewards = torch.tensor([1.0, 2.0, 100.0, 4.0])

@@ -156,7 +156,7 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
 
         self.assertEqual(errors, [r'Traceback \(most recent call last\)'])
 
-    def test_dmb_valid_candidate_shortfall_is_accepted(self):
+    def test_molecular_dmb_valid_candidate_shortfall_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'
             _write_metrics(
@@ -175,7 +175,9 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
                 ],
             )
 
-            result = monitor._read_metrics(self._dmb_spec(metrics_path))
+            result = monitor._read_metrics(
+                self._molecular_dmb_spec(metrics_path)
+            )
 
         self.assertEqual(result['max_step'], 1)
 
@@ -192,6 +194,8 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
                         'diverse_minibatch/candidate_count': 384.0,
                         'diverse_minibatch/valid_candidate_count': 383.75,
                         'diverse_minibatch/selected_count': 192.0,
+                        'diverse_minibatch/selected_valid_count': 191.75,
+                        'diverse_minibatch/selected_invalid_count': 0.25,
                         'diverse_minibatch/target_optimization_count': 192.0,
                         'diverse_minibatch/shortfall_count': 0.0,
                     }
@@ -202,7 +206,7 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
 
         self.assertEqual(result['max_step'], 1)
 
-    def test_dmb_zero_valid_candidates_are_accepted(self):
+    def test_progen2_dmb_zero_valid_candidates_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'
             _write_metrics(
@@ -214,16 +218,20 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
                         'grad_norm': 0.0,
                         'diverse_minibatch/candidate_count': 384,
                         'diverse_minibatch/valid_candidate_count': 0,
-                        'diverse_minibatch/selected_count': 0,
+                        'diverse_minibatch/selected_count': 192,
+                        'diverse_minibatch/selected_valid_count': 0,
+                        'diverse_minibatch/selected_invalid_count': 192,
                         'diverse_minibatch/target_optimization_count': 192,
-                        'diverse_minibatch/shortfall_count': 192,
+                        'diverse_minibatch/shortfall_count': 0,
                     }
                 ],
             )
 
-            result = monitor._read_metrics(self._dmb_spec(metrics_path))
-
-        self.assertEqual(result['max_step'], 39)
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'no valid selected candidates',
+            ):
+                monitor._read_metrics(self._dmb_spec(metrics_path))
 
     def test_dmb_inconsistent_shortfall_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -245,7 +253,9 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(RuntimeError, 'inconsistent shortfall_count'):
-                monitor._read_metrics(self._dmb_spec(metrics_path))
+                monitor._read_metrics(
+                    self._molecular_dmb_spec(metrics_path)
+                )
 
     @staticmethod
     def _entropy_spec(metrics_path):
@@ -265,6 +275,19 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             metrics_glob=str(metrics_path),
             method='dmb',
             expected_final_step=100,
+            expected_candidate_count=384,
+            expected_selected_count=192,
+            selection_includes_invalid_candidates=True,
+        )
+
+    @staticmethod
+    def _molecular_dmb_spec(metrics_path):
+        return monitor.JobSpec(
+            name='denovo_dmb',
+            job_id=1,
+            metrics_glob=str(metrics_path),
+            method='dmb',
+            expected_final_step=2000,
             expected_candidate_count=384,
             expected_selected_count=192,
         )

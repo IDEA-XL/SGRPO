@@ -106,29 +106,26 @@ def _molecule_run_is_complete(run_dir: Path, checkpoint_step: int) -> bool:
 def _resolve_progen2_checkpoint(
     *,
     config_stem: str,
+    job_id: int,
     checkpoint_step: int,
 ) -> Path:
-    relative_checkpoint = Path(f"checkpoint-{checkpoint_step:06d}")
-    candidates = sorted(
-        run_dir / relative_checkpoint
-        for run_dir in (RUNS_ROOT / "progen2_sgrpo").glob(f"{config_stem}_*")
+    checkpoint = (
+        RUNS_ROOT
+        / "progen2_sgrpo"
+        / f"{config_stem}_slurm{job_id}"
+        / f"checkpoint-{checkpoint_step:06d}"
     )
-    complete = [
-        checkpoint
-        for checkpoint in candidates
-        if all(
-            (checkpoint / name).is_file()
-            and (checkpoint / name).stat().st_size > 0
-            for name in ("trainer_state.pt", "model.safetensors", "config.json")
-        )
-        and _read_json_dict(checkpoint / "config.json") is not None
-    ]
-    if len(complete) != 1:
+    required_files = ("trainer_state.pt", "model.safetensors", "config.json")
+    if not all(
+        (checkpoint / name).is_file()
+        and (checkpoint / name).stat().st_size > 0
+        for name in required_files
+    ) or _read_json_dict(checkpoint / "config.json") is None:
         raise RuntimeError(
-            f"Expected exactly one completed checkpoint for {config_stem}, "
-            f"found {len(complete)}: {complete}"
+            f"Missing or incomplete checkpoint for {config_stem} job {job_id}: "
+            f"{checkpoint}"
         )
-    return complete[0]
+    return checkpoint
 
 
 def _require_completed_jobs(job_ids: dict[str, int]) -> None:
@@ -211,10 +208,12 @@ def main() -> None:
         ),
         "progen2_dmb": _resolve_progen2_checkpoint(
             config_stem=PROGEN2_DMB_CONFIG,
+            job_id=args.progen2_dmb_job_id,
             checkpoint_step=100,
         ),
         "progen2_entropy": _resolve_progen2_checkpoint(
             config_stem=PROGEN2_ENTROPY_CONFIG,
+            job_id=args.progen2_entropy_job_id,
             checkpoint_step=100,
         ),
     }

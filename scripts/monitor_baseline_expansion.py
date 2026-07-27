@@ -117,7 +117,7 @@ JOB_TEMPLATES = {
         "metrics_glob": str(
             RUNS_ROOT
             / "progen2_sgrpo"
-            / "progen2_dmb_grpo_ng192_bs2_len256_rbs16_ms100_*"
+            / "progen2_dmb_grpo_ng192_bs2_len256_rbs16_ms100_slurm{job_id}"
             / "metrics.jsonl"
         ),
         "method": "dmb",
@@ -130,7 +130,7 @@ JOB_TEMPLATES = {
         "metrics_glob": str(
             RUNS_ROOT
             / "progen2_sgrpo"
-            / "progen2_entropy001_grpo_ng96_bs2_len256_rbs16_ms100_*"
+            / "progen2_entropy001_grpo_ng96_bs2_len256_rbs16_ms100_slurm{job_id}"
             / "metrics.jsonl"
         ),
         "method": "entropy",

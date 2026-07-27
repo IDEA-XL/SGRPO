@@ -70,7 +70,7 @@ class LaunchBaselineExpansionSweepsTest(unittest.TestCase):
             launcher.RUNS_ROOT = root
             checkpoint = (
                 root
-                / "progen2_sgrpo/config_run/checkpoint-000100"
+                / "progen2_sgrpo/config_slurm123/checkpoint-000100"
             )
             checkpoint.mkdir(parents=True)
             (checkpoint / "trainer_state.pt").write_bytes(b"state")
@@ -79,12 +79,44 @@ class LaunchBaselineExpansionSweepsTest(unittest.TestCase):
             try:
                 resolved = launcher._resolve_progen2_checkpoint(
                     config_stem="config",
+                    job_id=123,
                     checkpoint_step=100,
                 )
             finally:
                 launcher.RUNS_ROOT = original_runs_root
 
         self.assertEqual(resolved, checkpoint)
+
+    def test_progen2_checkpoint_is_bound_to_requested_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_runs_root = launcher.RUNS_ROOT
+            root = Path(directory)
+            launcher.RUNS_ROOT = root
+            stale = (
+                root
+                / "progen2_sgrpo/config_slurm111/checkpoint-000100"
+            )
+            requested = (
+                root
+                / "progen2_sgrpo/config_slurm222/checkpoint-000100"
+            )
+            for checkpoint in (stale, requested):
+                checkpoint.mkdir(parents=True)
+                (checkpoint / "trainer_state.pt").write_bytes(b"state")
+                (checkpoint / "model.safetensors").write_bytes(b"model")
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"model": "p2"})
+                )
+            try:
+                resolved = launcher._resolve_progen2_checkpoint(
+                    config_stem="config",
+                    job_id=222,
+                    checkpoint_step=100,
+                )
+            finally:
+                launcher.RUNS_ROOT = original_runs_root
+
+        self.assertEqual(resolved, requested)
 
 
 if __name__ == "__main__":

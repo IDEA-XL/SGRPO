@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -63,17 +64,43 @@ def _resolve_molecule_checkpoint(
     relative_checkpoint = Path(
         f"checkpoint-{checkpoint_step:06d}/model.ckpt"
     )
-    matches = sorted(
+    candidates = sorted(task_root.glob(f"{config_stem}_*"))
+    matches = [
         run_dir / relative_checkpoint
-        for run_dir in task_root.glob(f"{config_stem}_*")
-        if (run_dir / relative_checkpoint).is_file()
-    )
+        for run_dir in candidates
+        if _molecule_run_is_complete(run_dir, checkpoint_step)
+    ]
     if len(matches) != 1:
         raise RuntimeError(
             f"Expected exactly one completed checkpoint for {config_stem}, "
-            f"found {len(matches)}: {matches}"
+            f"found {len(matches)} complete among {candidates}: {matches}"
         )
     return matches[0]
+
+
+def _read_json_dict(path: Path) -> dict | None:
+    if not path.is_file() or path.stat().st_size == 0:
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _molecule_run_is_complete(run_dir: Path, checkpoint_step: int) -> bool:
+    checkpoint_dir = run_dir / f"checkpoint-{checkpoint_step:06d}"
+    model_path = checkpoint_dir / "model.ckpt"
+    if not model_path.is_file() or model_path.stat().st_size == 0:
+        return False
+    checkpoint_state = _read_json_dict(checkpoint_dir / "trainer_state.json")
+    train_results = _read_json_dict(run_dir / "train_results.json")
+    return (
+        checkpoint_state is not None
+        and checkpoint_state.get("global_step") == checkpoint_step
+        and train_results is not None
+        and train_results.get("step") == checkpoint_step
+    )
 
 
 def _resolve_progen2_checkpoint(
@@ -91,8 +118,10 @@ def _resolve_progen2_checkpoint(
         for checkpoint in candidates
         if all(
             (checkpoint / name).is_file()
+            and (checkpoint / name).stat().st_size > 0
             for name in ("trainer_state.pt", "model.safetensors", "config.json")
         )
+        and _read_json_dict(checkpoint / "config.json") is not None
     ]
     if len(complete) != 1:
         raise RuntimeError(

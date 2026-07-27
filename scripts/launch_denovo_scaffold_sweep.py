@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve the scaffold-SGRPO checkpoint and launch the scaffold sweep DAG."""
+"""Resolve scaffold checkpoints and launch an incremental sweep DAG."""
 
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _require_completed_job(job_id: int) -> None:
+def _require_viable_job(job_id: int) -> tuple[str, str]:
     result = subprocess.run(
         [
             str(SACCT),
@@ -81,10 +81,15 @@ def _require_completed_job(job_id: int) -> None:
         record_job_id, record_state, exit_code = line.split("|", 2)
         if record_job_id == str(job_id):
             state = (record_state.split()[0].rstrip("+"), exit_code)
-    if state != ("COMPLETED", "0:0"):
+    if (
+        state is None
+        or state[0] not in {"PENDING", "RUNNING", "COMPLETED"}
+        or (state[0] == "COMPLETED" and state[1] != "0:0")
+    ):
         raise RuntimeError(
-            f"Scaffold SGRPO training job {job_id} is not complete: {state}"
+            f"Scaffold SGRPO training job {job_id} is not viable: {state}"
         )
+    return state
 
 
 def _validate_checkpoint(checkpoint: Path, label: str) -> Path:
@@ -115,11 +120,20 @@ def _resolve_sgrpo_checkpoint(job_id: int) -> Path:
     return _validate_checkpoint(checkpoint, f"scaffold SGRPO job {job_id}")
 
 
+def _expected_sgrpo_checkpoint(job_id: int) -> Path:
+    return (
+        RUNS_ROOT
+        / "cpgrpo_denovo"
+        / f"{SGRPO_CONFIG_STEM}_slurm{job_id}"
+        / "checkpoint-002000/model.ckpt"
+    )
+
+
 def _submit(script: Path, *options: str) -> str:
     command = [
         str(SBATCH),
         "--parsable",
-        "--exclude=server13",
+        "--exclude=server13,server59",
         *options,
         str(script),
     ]
@@ -145,18 +159,23 @@ def main() -> None:
             f"Sweep root already exists; refusing to mix results: {SWEEP_ROOT}"
         )
 
-    _require_completed_job(args.sgrpo_job_id)
+    training_state = _require_viable_job(args.sgrpo_job_id)
     checkpoints = {
         name: _validate_checkpoint(path, f"reused {name}")
         for name, path in REUSED_CHECKPOINTS.items()
     }
-    checkpoints["sgrpo"] = _resolve_sgrpo_checkpoint(args.sgrpo_job_id)
+    checkpoints["sgrpo"] = (
+        _resolve_sgrpo_checkpoint(args.sgrpo_job_id)
+        if training_state[0] == "COMPLETED"
+        else _expected_sgrpo_checkpoint(args.sgrpo_job_id)
+    )
 
     build_command = [
         sys.executable,
         str(REPO_ROOT / "scripts/build_denovo_scaffold_sweep_specs.py"),
         "--run-root",
         str(SWEEP_ROOT),
+        "--allow-pending-checkpoints",
     ]
     for name, checkpoint in checkpoints.items():
         build_command.extend([f"--{name}-checkpoint", str(checkpoint)])
@@ -173,6 +192,7 @@ def main() -> None:
     manifest = {
         "submitted_at": datetime.now(timezone.utc).isoformat(),
         "training_job_ids": {"sgrpo": args.sgrpo_job_id},
+        "training_job_states": {"sgrpo": list(training_state)},
         "checkpoints": {name: str(path) for name, path in checkpoints.items()},
         "controller_job_id": controller_job_id,
         "render_job_id": render_job_id,

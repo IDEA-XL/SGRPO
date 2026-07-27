@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve completed baseline checkpoints and launch their sweep controller."""
+"""Resolve baseline checkpoints and launch an incremental sweep controller."""
 
 from __future__ import annotations
 
@@ -128,7 +128,36 @@ def _resolve_progen2_checkpoint(
     return checkpoint
 
 
-def _require_completed_jobs(job_ids: dict[str, int]) -> None:
+def _expected_molecule_checkpoint(
+    *,
+    task_root: Path,
+    config_stem: str,
+    checkpoint_step: int,
+    job_id: int,
+) -> Path:
+    return (
+        task_root
+        / f"{config_stem}_slurm{job_id}"
+        / f"checkpoint-{checkpoint_step:06d}"
+        / "model.ckpt"
+    )
+
+
+def _expected_progen2_checkpoint(
+    *,
+    config_stem: str,
+    checkpoint_step: int,
+    job_id: int,
+) -> Path:
+    return (
+        RUNS_ROOT
+        / "progen2_sgrpo"
+        / f"{config_stem}_slurm{job_id}"
+        / f"checkpoint-{checkpoint_step:06d}"
+    )
+
+
+def _require_viable_jobs(job_ids: dict[str, int]) -> dict[str, tuple[str, str]]:
     if len(set(job_ids.values())) != len(job_ids):
         raise ValueError(f"Training job IDs must be distinct: {job_ids}")
     result = subprocess.run(
@@ -153,15 +182,23 @@ def _require_completed_jobs(job_ids: dict[str, int]) -> None:
         job_id, state, exit_code = line.split("|", 2)
         if job_id in expected_ids:
             states[job_id] = (state.split()[0].rstrip("+"), exit_code)
-    failures = {
+    named_states = {
         name: states.get(str(job_id))
         for name, job_id in job_ids.items()
-        if states.get(str(job_id)) != ("COMPLETED", "0:0")
+    }
+    failures = {
+        name: state
+        for name, state in named_states.items()
+        if state is None
+        or state[0]
+        not in {"PENDING", "RUNNING", "COMPLETED"}
+        or (state[0] == "COMPLETED" and state[1] != "0:0")
     }
     if failures:
         raise RuntimeError(
-            f"Baseline training jobs are not all successfully completed: {failures}"
+            f"Baseline training jobs are not viable: {failures}"
         )
+    return named_states
 
 
 def main() -> None:
@@ -175,46 +212,99 @@ def main() -> None:
             f"Refusing to overwrite an existing sweep controller state: {SWEEP_ROOT}"
         )
 
-    _require_completed_jobs(
-        {
-            "denovo_dmb": args.denovo_dmb_job_id,
-            "denovo_entropy": args.denovo_entropy_job_id,
-            "mmgenmol_dmb": args.mmgenmol_dmb_job_id,
-            "mmgenmol_entropy": args.mmgenmol_entropy_job_id,
-            "progen2_dmb": args.progen2_dmb_job_id,
-            "progen2_entropy": args.progen2_entropy_job_id,
-        }
-    )
+    job_ids = {
+        "denovo_dmb": args.denovo_dmb_job_id,
+        "denovo_entropy": args.denovo_entropy_job_id,
+        "mmgenmol_dmb": args.mmgenmol_dmb_job_id,
+        "mmgenmol_entropy": args.mmgenmol_entropy_job_id,
+        "progen2_dmb": args.progen2_dmb_job_id,
+        "progen2_entropy": args.progen2_entropy_job_id,
+    }
+    job_states = _require_viable_jobs(job_ids)
+    denovo_root = RUNS_ROOT / "cpgrpo_denovo"
+    mmgenmol_root = RUNS_ROOT / "cpgrpo_denovo_pocket_prefix"
     checkpoints = {
-        "denovo_dmb": _resolve_molecule_checkpoint(
-            task_root=RUNS_ROOT / "cpgrpo_denovo",
-            config_stem=DENOVO_DMB_CONFIG,
-            checkpoint_step=2000,
+        "denovo_dmb": (
+            _resolve_molecule_checkpoint(
+                task_root=denovo_root,
+                config_stem=DENOVO_DMB_CONFIG,
+                checkpoint_step=2000,
+            )
+            if job_states["denovo_dmb"][0] == "COMPLETED"
+            else _expected_molecule_checkpoint(
+                task_root=denovo_root,
+                config_stem=DENOVO_DMB_CONFIG,
+                checkpoint_step=2000,
+                job_id=args.denovo_dmb_job_id,
+            )
         ),
-        "denovo_entropy": _resolve_molecule_checkpoint(
-            task_root=RUNS_ROOT / "cpgrpo_denovo",
-            config_stem=DENOVO_ENTROPY_CONFIG,
-            checkpoint_step=2000,
+        "denovo_entropy": (
+            _resolve_molecule_checkpoint(
+                task_root=denovo_root,
+                config_stem=DENOVO_ENTROPY_CONFIG,
+                checkpoint_step=2000,
+            )
+            if job_states["denovo_entropy"][0] == "COMPLETED"
+            else _expected_molecule_checkpoint(
+                task_root=denovo_root,
+                config_stem=DENOVO_ENTROPY_CONFIG,
+                checkpoint_step=2000,
+                job_id=args.denovo_entropy_job_id,
+            )
         ),
-        "mmgenmol_dmb": _resolve_molecule_checkpoint(
-            task_root=RUNS_ROOT / "cpgrpo_denovo_pocket_prefix",
-            config_stem=MMGENMOL_DMB_CONFIG,
-            checkpoint_step=1000,
+        "mmgenmol_dmb": (
+            _resolve_molecule_checkpoint(
+                task_root=mmgenmol_root,
+                config_stem=MMGENMOL_DMB_CONFIG,
+                checkpoint_step=1000,
+            )
+            if job_states["mmgenmol_dmb"][0] == "COMPLETED"
+            else _expected_molecule_checkpoint(
+                task_root=mmgenmol_root,
+                config_stem=MMGENMOL_DMB_CONFIG,
+                checkpoint_step=1000,
+                job_id=args.mmgenmol_dmb_job_id,
+            )
         ),
-        "mmgenmol_entropy": _resolve_molecule_checkpoint(
-            task_root=RUNS_ROOT / "cpgrpo_denovo_pocket_prefix",
-            config_stem=MMGENMOL_ENTROPY_CONFIG,
-            checkpoint_step=1000,
+        "mmgenmol_entropy": (
+            _resolve_molecule_checkpoint(
+                task_root=mmgenmol_root,
+                config_stem=MMGENMOL_ENTROPY_CONFIG,
+                checkpoint_step=1000,
+            )
+            if job_states["mmgenmol_entropy"][0] == "COMPLETED"
+            else _expected_molecule_checkpoint(
+                task_root=mmgenmol_root,
+                config_stem=MMGENMOL_ENTROPY_CONFIG,
+                checkpoint_step=1000,
+                job_id=args.mmgenmol_entropy_job_id,
+            )
         ),
-        "progen2_dmb": _resolve_progen2_checkpoint(
-            config_stem=PROGEN2_DMB_CONFIG,
-            job_id=args.progen2_dmb_job_id,
-            checkpoint_step=100,
+        "progen2_dmb": (
+            _resolve_progen2_checkpoint(
+                config_stem=PROGEN2_DMB_CONFIG,
+                job_id=args.progen2_dmb_job_id,
+                checkpoint_step=100,
+            )
+            if job_states["progen2_dmb"][0] == "COMPLETED"
+            else _expected_progen2_checkpoint(
+                config_stem=PROGEN2_DMB_CONFIG,
+                checkpoint_step=100,
+                job_id=args.progen2_dmb_job_id,
+            )
         ),
-        "progen2_entropy": _resolve_progen2_checkpoint(
-            config_stem=PROGEN2_ENTROPY_CONFIG,
-            job_id=args.progen2_entropy_job_id,
-            checkpoint_step=100,
+        "progen2_entropy": (
+            _resolve_progen2_checkpoint(
+                config_stem=PROGEN2_ENTROPY_CONFIG,
+                job_id=args.progen2_entropy_job_id,
+                checkpoint_step=100,
+            )
+            if job_states["progen2_entropy"][0] == "COMPLETED"
+            else _expected_progen2_checkpoint(
+                config_stem=PROGEN2_ENTROPY_CONFIG,
+                checkpoint_step=100,
+                job_id=args.progen2_entropy_job_id,
+            )
         ),
     }
 
@@ -223,6 +313,7 @@ def main() -> None:
         str(REPO_ROOT / "scripts/build_baseline_expansion_sweep_specs.py"),
         "--run-root",
         str(SWEEP_ROOT),
+        "--allow-pending-checkpoints",
         "--denovo-dmb-checkpoint",
         str(checkpoints["denovo_dmb"]),
         "--denovo-entropy-checkpoint",
@@ -283,6 +374,18 @@ def main() -> None:
             "Could not parse materialization job ID from "
             f"{materialize_result.stdout!r}"
         )
+    submission = {
+        "training_job_ids": job_ids,
+        "training_job_states": {
+            name: list(state) for name, state in job_states.items()
+        },
+        "checkpoints": {name: str(path) for name, path in checkpoints.items()},
+        "controller_job_id": int(controller_job_id),
+        "materialize_job_id": int(materialize_job_id),
+    }
+    (SWEEP_ROOT / "pipeline_submission.json").write_text(
+        json.dumps(submission, indent=2, sort_keys=True) + "\n"
+    )
     print("Resolved checkpoints:")
     for name, checkpoint in checkpoints.items():
         print(f"  {name}: {checkpoint}")

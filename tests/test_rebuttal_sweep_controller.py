@@ -1,4 +1,6 @@
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -102,6 +104,61 @@ class RebuttalSweepControllerTest(unittest.TestCase):
             controller._refresh_task_states(state, tasks, set())
 
         self.assertEqual(state["tasks"]["task"]["status"], "complete")
+
+    def test_ready_tasks_wait_for_external_checkpoint(self):
+        checkpoint_ready = False
+        task = controller.TaskSpec(
+            key="task",
+            group="group",
+            array_id=0,
+            prerequisites=(),
+            validator=lambda: False,
+            readiness_validator=lambda: checkpoint_ready,
+        )
+        state = {"tasks": {}}
+
+        self.assertEqual(controller._ready_tasks(state, {"task": task}), {})
+
+        checkpoint_ready = True
+        self.assertEqual(
+            controller._ready_tasks(state, {"task": task}),
+            {"group": [task]},
+        )
+
+    def test_molecule_checkpoint_requires_complete_final_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            checkpoint_dir = run_dir / "checkpoint-000100"
+            checkpoint_dir.mkdir(parents=True)
+            checkpoint = checkpoint_dir / "model.ckpt"
+            checkpoint.write_bytes(b"model")
+            (checkpoint_dir / "trainer_state.json").write_text(
+                json.dumps({"global_step": 100})
+            )
+            (run_dir / "train_results.json").write_text(
+                json.dumps({"step": 99})
+            )
+
+            self.assertFalse(controller._molecule_checkpoint_ready(checkpoint))
+
+            (run_dir / "train_results.json").write_text(
+                json.dumps({"step": 100})
+            )
+            self.assertTrue(controller._molecule_checkpoint_ready(checkpoint))
+
+    def test_progen2_checkpoint_requires_complete_artifacts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "checkpoint-000100"
+            checkpoint.mkdir()
+            (checkpoint / "config.json").write_text(
+                json.dumps({"model_type": "progen"})
+            )
+            (checkpoint / "model.safetensors").write_bytes(b"model")
+
+            self.assertFalse(controller._progen2_checkpoint_ready(checkpoint))
+
+            (checkpoint / "trainer_state.pt").write_bytes(b"state")
+            self.assertTrue(controller._progen2_checkpoint_ready(checkpoint))
 
 
 if __name__ == "__main__":

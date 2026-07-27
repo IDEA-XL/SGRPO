@@ -16,20 +16,30 @@ DEFAULT_RUN_ROOT = Path(
 SCAFFOLD_DIVERSITY_METRIC = "relative_scaffold_diversity"
 
 
-def _checkpoint_file(value: str) -> Path:
-    path = Path(value)
-    if not path.is_file() or path.stat().st_size == 0:
-        raise argparse.ArgumentTypeError(f"Checkpoint file does not exist or is empty: {path}")
-    return path
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
-    parser.add_argument("--grpo-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--sgrpo-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--entropy-checkpoint", type=_checkpoint_file, required=True)
-    return parser.parse_args()
+    parser.add_argument("--grpo-checkpoint", type=Path, required=True)
+    parser.add_argument("--sgrpo-checkpoint", type=Path, required=True)
+    parser.add_argument("--entropy-checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--allow-pending-checkpoints",
+        action="store_true",
+        help="Build specs while the scaffold-SGRPO checkpoint is still pending.",
+    )
+    args = parser.parse_args()
+    missing = [
+        str(path)
+        for path in (
+            args.grpo_checkpoint,
+            args.sgrpo_checkpoint,
+            args.entropy_checkpoint,
+        )
+        if not path.is_file() or path.stat().st_size == 0
+    ]
+    if missing and not args.allow_pending_checkpoints:
+        parser.error("Missing checkpoint paths:\n" + "\n".join(missing))
+    return args
 
 
 def main() -> None:

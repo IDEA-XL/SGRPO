@@ -16,30 +16,42 @@ DEFAULT_RUN_ROOT = Path(
 PROGEN2_TEMPERATURES = tuple(round(index / 10.0, 1) for index in range(1, 13))
 
 
-def _checkpoint_file(value: str) -> Path:
-    path = Path(value)
-    if not path.is_file():
-        raise argparse.ArgumentTypeError(f"Checkpoint file does not exist: {path}")
-    return path
-
-
-def _checkpoint_dir(value: str) -> Path:
-    path = Path(value)
-    if not path.is_dir():
-        raise argparse.ArgumentTypeError(f"Checkpoint directory does not exist: {path}")
-    return path
-
-
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, default=DEFAULT_RUN_ROOT)
-    parser.add_argument("--denovo-dmb-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--denovo-entropy-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--mmgenmol-dmb-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--mmgenmol-entropy-checkpoint", type=_checkpoint_file, required=True)
-    parser.add_argument("--progen2-dmb-checkpoint", type=_checkpoint_dir, required=True)
-    parser.add_argument("--progen2-entropy-checkpoint", type=_checkpoint_dir, required=True)
-    return parser.parse_args()
+    parser.add_argument("--denovo-dmb-checkpoint", type=Path, required=True)
+    parser.add_argument("--denovo-entropy-checkpoint", type=Path, required=True)
+    parser.add_argument("--mmgenmol-dmb-checkpoint", type=Path, required=True)
+    parser.add_argument("--mmgenmol-entropy-checkpoint", type=Path, required=True)
+    parser.add_argument("--progen2-dmb-checkpoint", type=Path, required=True)
+    parser.add_argument("--progen2-entropy-checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--allow-pending-checkpoints",
+        action="store_true",
+        help="Build specs for checkpoints that are expected from active training jobs.",
+    )
+    args = parser.parse_args()
+    file_fields = (
+        "denovo_dmb_checkpoint",
+        "denovo_entropy_checkpoint",
+        "mmgenmol_dmb_checkpoint",
+        "mmgenmol_entropy_checkpoint",
+    )
+    directory_fields = ("progen2_dmb_checkpoint", "progen2_entropy_checkpoint")
+    missing = [
+        str(getattr(args, field))
+        for field in file_fields
+        if not getattr(args, field).is_file()
+        or getattr(args, field).stat().st_size == 0
+    ]
+    missing.extend(
+        str(getattr(args, field))
+        for field in directory_fields
+        if not getattr(args, field).is_dir()
+    )
+    if missing and not args.allow_pending_checkpoints:
+        parser.error("Missing checkpoint paths:\n" + "\n".join(missing))
+    return args
 
 
 def main() -> None:

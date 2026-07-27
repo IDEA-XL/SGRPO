@@ -50,6 +50,10 @@ DOCKING_CACHE_DIR = Path(
 Validator = Callable[[], bool]
 
 
+def _always_ready() -> bool:
+    return True
+
+
 @dataclass(frozen=True)
 class TaskSpec:
     key: str
@@ -57,6 +61,7 @@ class TaskSpec:
     array_id: int | None
     prerequisites: tuple[str, ...]
     validator: Validator
+    readiness_validator: Validator = _always_ready
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,45 @@ def _jsonl_has_rows(path: Path, expected: int) -> bool:
 
 def _nonempty_file(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
+
+
+def _molecule_checkpoint_ready(path: Path) -> bool:
+    if not _nonempty_file(path):
+        return False
+    if not path.parent.name.startswith("checkpoint-"):
+        return True
+    try:
+        expected_step = int(path.parent.name.removeprefix("checkpoint-"))
+        checkpoint_state = json.loads(
+            (path.parent / "trainer_state.json").read_text()
+        )
+        train_results = json.loads(
+            (path.parents[1] / "train_results.json").read_text()
+        )
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(checkpoint_state, dict)
+        and checkpoint_state.get("global_step") == expected_step
+        and isinstance(train_results, dict)
+        and train_results.get("step") == expected_step
+    )
+
+
+def _progen2_checkpoint_ready(path: Path) -> bool:
+    if not path.is_dir():
+        return False
+    if not _nonempty_file(path / "config.json"):
+        return False
+    if not any(
+        _nonempty_file(path / name)
+        for name in ("model.safetensors", "pytorch_model.bin")
+    ):
+        return False
+    return (
+        not path.name.startswith("checkpoint-")
+        or _nonempty_file(path / "trainer_state.pt")
+    )
 
 
 def _all_valid(validators: Iterable[Validator]) -> Validator:
@@ -237,6 +281,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
         seed = int(row["seed"])
         config = yaml.safe_load(Path(row["config_path"]).read_text())
         output_path = Path(config["output_json_path"])
+        checkpoint_path = Path(config["experiments"][0]["checkpoint_path"])
         expected_points = len(config["randomness_temperature_pairs"])
         if expected_points <= 0:
             raise ValueError(f"Empty de novo sweep in {row['config_path']}")
@@ -252,6 +297,9 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 prerequisites=(),
                 validator=lambda path=output_path, expected=expected_points: _json_has_length(
                     path, expected
+                ),
+                readiness_validator=lambda path=checkpoint_path: _molecule_checkpoint_ready(
+                    path
                 ),
             ),
         )
@@ -372,6 +420,9 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                     array_id=task_id,
                     prerequisites=(),
                     validator=lambda path=generated_path: _jsonl_has_rows(path, 1600),
+                    readiness_validator=lambda path=Path(
+                        row["checkpoint_path"]
+                    ): _molecule_checkpoint_ready(path),
                 ),
             )
             _add_task(
@@ -541,6 +592,9 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                     validator=lambda path=Path(
                         row["generation_rows_path"]
                     ): _jsonl_has_rows(path, 512),
+                    readiness_validator=lambda path=Path(
+                        row["checkpoint_dir"]
+                    ): _progen2_checkpoint_ready(path),
                 ),
             )
             _add_task(
@@ -881,7 +935,10 @@ def _ready_tasks(
         entry = state["tasks"].get(key)
         if entry is not None and entry.get("status") in {"submitted", "complete"}:
             continue
-        if all(prerequisite in completed for prerequisite in task.prerequisites):
+        if (
+            all(prerequisite in completed for prerequisite in task.prerequisites)
+            and task.readiness_validator()
+        ):
             ready.setdefault(task.group, []).append(task)
     for group_tasks in ready.values():
         group_tasks.sort(key=lambda task: (-1 if task.array_id is None else task.array_id))

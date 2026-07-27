@@ -17,6 +17,7 @@ source /public/home/xinwuye/miniconda/etc/profile.d/conda.sh
 conda activate genmol
 export PATH=/opt/gridview/slurm/bin:${PATH}
 export REBUTTAL_RUN_OUTPUT_ROOT="${RUN_ROOT}"
+export PROGEN2_PACKED_BY_EXPERIMENT=1
 
 cd "${REPO_DIR}"
 python -u scripts/drive_rebuttal_dense_sweeps.py

@@ -237,9 +237,20 @@ def _cycle_prompt_batch(prompts, batch_size, start_index):
 
 def _write_jsonl(path, payloads):
     _ensure_parent_dir(path)
-    with open(path, 'w') as handle:
+    temporary_path = f'{path}.tmp.{os.getpid()}'
+    with open(temporary_path, 'w') as handle:
         for payload in payloads:
             handle.write(json.dumps(payload, sort_keys=True) + '\n')
+    os.replace(temporary_path, path)
+
+
+def _write_json(path, payload):
+    _ensure_parent_dir(path)
+    temporary_path = f'{path}.tmp.{os.getpid()}'
+    with open(temporary_path, 'w') as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write('\n')
+    os.replace(temporary_path, path)
 
 
 def _read_jsonl(path):
@@ -250,6 +261,142 @@ def _read_jsonl(path):
             if not line:
                 continue
             rows.append(json.loads(line))
+    return rows
+
+
+def _packed_reward_base_path(config, reward_name):
+    if reward_name == 'naturalness':
+        return config.packed_naturalness_scores_path
+    if reward_name == 'stability':
+        return config.packed_stability_scores_path
+    raise ValueError(
+        f'Packed GPU reward only supports naturalness/stability, got {reward_name}'
+    )
+
+
+def _packed_reward_experiment_path(config, reward_name, experiment_name):
+    if (
+        not experiment_name
+        or os.path.basename(experiment_name) != experiment_name
+        or experiment_name in {'.', '..'}
+    ):
+        raise ValueError(f'Unsafe experiment name for packed reward path: {experiment_name!r}')
+    base_path = _packed_reward_base_path(config, reward_name)
+    return os.path.join(
+        os.path.dirname(base_path),
+        'by_experiment',
+        experiment_name,
+        os.path.basename(base_path),
+    )
+
+
+def _packed_reward_summary_path(output_path):
+    return f'{output_path}.summary.json'
+
+
+def _write_packed_reward_summary(
+    output_path,
+    reward_name,
+    experiment_names,
+    task_ids,
+    num_output_rows,
+):
+    _write_json(
+        _packed_reward_summary_path(output_path),
+        {
+            'schema_version': 1,
+            'reward_name': reward_name,
+            'experiments': list(experiment_names),
+            'task_ids': list(map(int, task_ids)),
+            'num_output_rows': int(num_output_rows),
+            'output_bytes': int(os.path.getsize(output_path)),
+        },
+    )
+
+
+def _expected_valid_sample_keys(tasks, expected_rows_per_task=None):
+    keys = set()
+    for task in tasks:
+        task_id = int(task['task_id'])
+        rows = _read_jsonl(task['generation_rows_path'])
+        if expected_rows_per_task is not None and len(rows) != expected_rows_per_task:
+            raise RuntimeError(
+                f'Generation task {task_id} has {len(rows)} rows, '
+                f'expected {expected_rows_per_task}'
+            )
+        for row in rows:
+            row_task_id = int(row['task_id'])
+            if row_task_id != task_id:
+                raise RuntimeError(
+                    f'Generation row task_id mismatch for task {task_id}: {row_task_id}'
+                )
+            if not row['is_valid']:
+                continue
+            key = (task_id, int(row['sample_index']))
+            if key in keys:
+                raise RuntimeError(f'Duplicate valid generation key: {key}')
+            keys.add(key)
+    return keys
+
+
+def _validated_packed_reward_rows(
+    output_path,
+    reward_name,
+    experiment_name,
+    tasks,
+    expected_rows_per_task,
+):
+    summary_path = _packed_reward_summary_path(output_path)
+    if not os.path.isfile(output_path) or not os.path.isfile(summary_path):
+        raise FileNotFoundError(
+            f'Missing packed {reward_name} output or summary for '
+            f'{experiment_name}: {output_path}'
+        )
+    with open(summary_path) as handle:
+        summary = json.load(handle)
+    expected_task_ids = sorted(int(task['task_id']) for task in tasks)
+    expected_summary = {
+        'schema_version': 1,
+        'reward_name': reward_name,
+        'experiments': [experiment_name],
+        'task_ids': expected_task_ids,
+    }
+    for key, expected in expected_summary.items():
+        if summary.get(key) != expected:
+            raise RuntimeError(
+                f'Packed {reward_name} summary mismatch for {experiment_name}: '
+                f'{key}={summary.get(key)!r}, expected {expected!r}'
+            )
+    if int(summary.get('output_bytes', -1)) != os.path.getsize(output_path):
+        raise RuntimeError(
+            f'Packed {reward_name} output size mismatch for {experiment_name}'
+        )
+
+    rows = _read_jsonl(output_path)
+    if int(summary.get('num_output_rows', -1)) != len(rows):
+        raise RuntimeError(
+            f'Packed {reward_name} row-count mismatch for {experiment_name}'
+        )
+    expected_keys = _expected_valid_sample_keys(tasks, expected_rows_per_task)
+    actual_keys = set()
+    for row in rows:
+        key = (int(row['task_id']), int(row['sample_index']))
+        if key in actual_keys:
+            raise RuntimeError(
+                f'Duplicate packed {reward_name} key for {experiment_name}: {key}'
+            )
+        actual_keys.add(key)
+        for value_key in (f'{reward_name}_raw', reward_name):
+            value = row.get(value_key)
+            if value is None or not math.isfinite(float(value)):
+                raise RuntimeError(
+                    f'Invalid {value_key} for {experiment_name} at {key}: {value!r}'
+                )
+    if actual_keys != expected_keys:
+        raise RuntimeError(
+            f'Packed {reward_name} key coverage mismatch for {experiment_name}: '
+            f'actual={len(actual_keys)} expected={len(expected_keys)}'
+        )
     return rows
 
 
@@ -527,6 +674,7 @@ def _score_packed_calibrated_gpu_reward(config, tasks, reward_name, output_path)
         del policy
     scorer.release()
     _write_jsonl(output_path, payloads)
+    return payloads
 
 
 def _score_point_reward_task(config, task, reward_name, output_path):
@@ -623,6 +771,8 @@ def _index_reward_rows(path, value_keys):
     index = {}
     for row in _read_jsonl(path):
         key = (int(row['task_id']), int(row['sample_index']))
+        if key in index:
+            raise RuntimeError(f'Duplicate reward row key in {path}: {key}')
         index[key] = {field: row.get(field) for field in value_keys}
     return index
 
@@ -866,6 +1016,17 @@ def _aggregate_results(config, tasks):
         config.packed_stability_scores_path,
         ('stability_raw', 'stability', 'stability_q10', 'stability_q90'),
     )
+    expected_valid_keys = _expected_valid_sample_keys(tasks, config.num_samples)
+    for reward_name, index in (
+        ('naturalness', naturalness_index),
+        ('stability', stability_index),
+    ):
+        actual_keys = set(index)
+        if actual_keys != expected_valid_keys:
+            raise RuntimeError(
+                f'Packed {reward_name} coverage mismatch during aggregation: '
+                f'actual={len(actual_keys)} expected={len(expected_valid_keys)}'
+            )
     foldability_index = {}
     developability_index = {}
     for task in tasks:
@@ -947,16 +1108,102 @@ def cmd_generate_task(args):
 
 
 def cmd_score_packed_gpu_reward(args):
-    config = load_config(args.config)
+    experiment_name = getattr(args, 'experiment_name', None)
+    config = load_config(
+        args.config,
+        validate_checkpoint_dirs=experiment_name is None,
+    )
     tasks = _load_point_tasks(config.tasks_path)
-    if args.reward_name == 'naturalness':
-        output_path = config.packed_naturalness_scores_path
-    elif args.reward_name == 'stability':
-        output_path = config.packed_stability_scores_path
+    if experiment_name is None:
+        selected_tasks = tasks
+        output_path = _packed_reward_base_path(config, args.reward_name)
     else:
-        raise ValueError(f'Packed GPU reward only supports naturalness/stability, got {args.reward_name}')
-    _score_packed_calibrated_gpu_reward(config, tasks, args.reward_name, output_path)
+        selected_tasks = [
+            task for task in tasks if task['experiment'] == experiment_name
+        ]
+        if not selected_tasks:
+            raise ValueError(f'No point tasks found for experiment={experiment_name!r}')
+        checkpoint_dirs = {
+            task['checkpoint_dir'] for task in selected_tasks
+        }
+        if len(checkpoint_dirs) != 1:
+            raise RuntimeError(
+                f'Experiment {experiment_name!r} references multiple checkpoints: '
+                f'{sorted(checkpoint_dirs)}'
+            )
+        _validate_checkpoint_dir(next(iter(checkpoint_dirs)))
+        output_path = _packed_reward_experiment_path(
+            config,
+            args.reward_name,
+            experiment_name,
+        )
+    payloads = _score_packed_calibrated_gpu_reward(
+        config,
+        selected_tasks,
+        args.reward_name,
+        output_path,
+    )
+    if experiment_name is not None:
+        _write_packed_reward_summary(
+            output_path=output_path,
+            reward_name=args.reward_name,
+            experiment_names=(experiment_name,),
+            task_ids=sorted(int(task['task_id']) for task in selected_tasks),
+            num_output_rows=len(payloads),
+        )
     logger.info('Wrote packed %s scores to %s', args.reward_name, output_path)
+
+
+def cmd_merge_packed_gpu_rewards(args):
+    config = load_config(args.config, validate_checkpoint_dirs=False)
+    tasks = _load_point_tasks(config.tasks_path)
+    task_experiments = {task['experiment'] for task in tasks}
+    configured_experiments = [experiment.name for experiment in config.experiments]
+    if task_experiments != set(configured_experiments):
+        raise RuntimeError(
+            'Point-task experiments do not match configured experiments: '
+            f'tasks={sorted(task_experiments)} config={configured_experiments}'
+        )
+
+    for reward_name in ('naturalness', 'stability'):
+        merged_rows = []
+        for experiment_name in configured_experiments:
+            experiment_tasks = [
+                task for task in tasks if task['experiment'] == experiment_name
+            ]
+            input_path = _packed_reward_experiment_path(
+                config,
+                reward_name,
+                experiment_name,
+            )
+            merged_rows.extend(
+                _validated_packed_reward_rows(
+                    output_path=input_path,
+                    reward_name=reward_name,
+                    experiment_name=experiment_name,
+                    tasks=experiment_tasks,
+                    expected_rows_per_task=config.num_samples,
+                )
+            )
+        merged_rows.sort(
+            key=lambda row: (int(row['task_id']), int(row['sample_index']))
+        )
+        output_path = _packed_reward_base_path(config, reward_name)
+        _write_jsonl(output_path, merged_rows)
+        _write_packed_reward_summary(
+            output_path=output_path,
+            reward_name=reward_name,
+            experiment_names=configured_experiments,
+            task_ids=sorted(int(task['task_id']) for task in tasks),
+            num_output_rows=len(merged_rows),
+        )
+        logger.info(
+            'Merged %d packed %s rows across %d experiments into %s',
+            len(merged_rows),
+            reward_name,
+            len(configured_experiments),
+            output_path,
+        )
 
 
 def cmd_score_point_reward_task(args):
@@ -1085,6 +1332,10 @@ def main():
     packed_gpu_reward = subparsers.add_parser('score-packed-gpu-reward')
     packed_gpu_reward.add_argument('--config', required=True)
     packed_gpu_reward.add_argument('--reward-name', required=True, choices=('naturalness', 'stability'))
+    packed_gpu_reward.add_argument('--experiment-name')
+
+    merge_packed_gpu_rewards = subparsers.add_parser('merge-packed-gpu-rewards')
+    merge_packed_gpu_rewards.add_argument('--config', required=True)
 
     point_reward_task = subparsers.add_parser('score-point-reward-task')
     point_reward_task.add_argument('--config', required=True)
@@ -1108,6 +1359,9 @@ def main():
         return
     if args.mode == 'score-packed-gpu-reward':
         cmd_score_packed_gpu_reward(args)
+        return
+    if args.mode == 'merge-packed-gpu-rewards':
+        cmd_merge_packed_gpu_rewards(args)
         return
     if args.mode == 'score-point-reward-task':
         cmd_score_point_reward_task(args)

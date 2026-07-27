@@ -144,6 +144,176 @@ class ProGen2SweepIncrementalTest(unittest.TestCase):
             ):
                 pipeline.load_config(config_path)
 
+    def test_packed_reward_scores_only_selected_ready_experiment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path, generation_path = self._write_config_and_tasks(directory)
+            generated = {
+                "task_id": 1,
+                "experiment": "ready",
+                "display_name": "Ready",
+                "temperature": 0.8,
+                "sample_index": 0,
+                "prompt_text": "1",
+                "decoded_text": "A",
+                "raw_sequence": "A",
+                "sequence": "A",
+                "is_valid": True,
+                "invalid_reason": None,
+            }
+            generation_path.write_text(json.dumps(generated) + "\n")
+
+            class FakeScorer:
+                def score_raw(self, sequences):
+                    return [0.5] * len(sequences)
+
+                def release(self):
+                    return None
+
+            with (
+                mock.patch.object(pipeline, "resolve_device", return_value=object()),
+                mock.patch.object(pipeline, "load_prompt_texts", return_value=["1"]),
+                mock.patch.object(pipeline, "_instantiate_policy", return_value=object()),
+                mock.patch.object(
+                    pipeline,
+                    "_collect_calibration_sequences",
+                    return_value=["A"],
+                ),
+                mock.patch.object(
+                    pipeline,
+                    "_instantiate_gpu_scorer",
+                    return_value=FakeScorer(),
+                ),
+            ):
+                pipeline.cmd_score_packed_gpu_reward(
+                    SimpleNamespace(
+                        config=str(config_path),
+                        reward_name="naturalness",
+                        experiment_name="ready",
+                    )
+                )
+
+            config = pipeline.load_config(
+                config_path,
+                validate_checkpoint_dirs=False,
+            )
+            output_path = Path(
+                pipeline._packed_reward_experiment_path(
+                    config,
+                    "naturalness",
+                    "ready",
+                )
+            )
+            rows = [
+                json.loads(line)
+                for line in output_path.read_text().splitlines()
+                if line.strip()
+            ]
+            summary = json.loads(
+                Path(
+                    pipeline._packed_reward_summary_path(output_path)
+                ).read_text()
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(summary["experiments"], ["ready"])
+            self.assertEqual(summary["task_ids"], [1])
+            self.assertEqual(summary["num_output_rows"], 1)
+
+    def test_merge_packed_rewards_combines_independent_experiments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path, ready_generation_path = self._write_config_and_tasks(directory)
+            raw_config = yaml.safe_load(config_path.read_text())
+            tasks_path = Path(raw_config["tasks_path"])
+            with tasks_path.open() as handle:
+                ready_task = next(csv.DictReader(handle, delimiter="\t"))
+
+            pending_generation_path = Path(directory) / "pending-generated.jsonl"
+            pending_task = {
+                **ready_task,
+                "task_id": "0",
+                "experiment": "pending",
+                "display_name": "Pending",
+                "checkpoint_dir": raw_config["experiments"][0]["checkpoint_dir"],
+                "generation_rows_path": str(pending_generation_path),
+            }
+            with tasks_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=pipeline.POINT_TASK_FIELDNAMES,
+                    delimiter="\t",
+                )
+                writer.writeheader()
+                writer.writerows((pending_task, ready_task))
+
+            for task, generation_path in (
+                (pending_task, pending_generation_path),
+                (ready_task, ready_generation_path),
+            ):
+                generation_path.write_text(
+                    json.dumps(
+                        {
+                            "task_id": int(task["task_id"]),
+                            "experiment": task["experiment"],
+                            "display_name": task["display_name"],
+                            "temperature": 0.8,
+                            "sample_index": 0,
+                            "prompt_text": "1",
+                            "decoded_text": "A",
+                            "raw_sequence": "A",
+                            "sequence": "A",
+                            "is_valid": True,
+                            "invalid_reason": None,
+                        }
+                    )
+                    + "\n"
+                )
+
+            config = pipeline.load_config(
+                config_path,
+                validate_checkpoint_dirs=False,
+            )
+            for reward_name in ("naturalness", "stability"):
+                for task in (pending_task, ready_task):
+                    experiment_name = task["experiment"]
+                    output_path = pipeline._packed_reward_experiment_path(
+                        config,
+                        reward_name,
+                        experiment_name,
+                    )
+                    payload = {
+                        "task_id": int(task["task_id"]),
+                        "sample_index": 0,
+                        f"{reward_name}_raw": 0.5,
+                        reward_name: 0.5,
+                        f"{reward_name}_q10": 0.1,
+                        f"{reward_name}_q90": 0.9,
+                    }
+                    pipeline._write_jsonl(output_path, [payload])
+                    pipeline._write_packed_reward_summary(
+                        output_path=output_path,
+                        reward_name=reward_name,
+                        experiment_names=(experiment_name,),
+                        task_ids=(int(task["task_id"]),),
+                        num_output_rows=1,
+                    )
+
+            pipeline.cmd_merge_packed_gpu_rewards(
+                SimpleNamespace(config=str(config_path))
+            )
+
+            for reward_name in ("naturalness", "stability"):
+                output_path = Path(
+                    pipeline._packed_reward_base_path(config, reward_name)
+                )
+                rows = [
+                    json.loads(line)
+                    for line in output_path.read_text().splitlines()
+                    if line.strip()
+                ]
+                self.assertEqual(
+                    [row["task_id"] for row in rows],
+                    [0, 1],
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

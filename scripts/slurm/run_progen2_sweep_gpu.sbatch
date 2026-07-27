@@ -16,6 +16,7 @@ CONFIG_PATH=${CONFIG_PATH:-configs/progen2_temperature_sweep_pipeline_20260430.y
 MODE=${MODE:-}
 TASK_ID=${TASK_ID:-${SLURM_ARRAY_TASK_ID:-}}
 REWARD_NAME=${REWARD_NAME:-}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-}
 PYTHON_OVERLAY_DIR=${PYTHON_OVERLAY_DIR:-/public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/python_overlay}
 PROTBERT_DIR=${PROTBERT_DIR:-/public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/prot_bert_bfd}
 CUDA_TOOLCHAIN_DIR=${CUDA_TOOLCHAIN_DIR:-/public/home/xinwuye/ai4s-tool-joint-train/runs/progen2_models/cuda_toolchain_cu124}
@@ -115,6 +116,9 @@ elif [[ "${MODE}" == "score-packed-gpu-reward" ]]; then
     exit 1
   fi
   cmd+=(--reward-name "${REWARD_NAME}")
+  if [[ -n "${EXPERIMENT_NAME}" ]]; then
+    cmd+=(--experiment-name "${EXPERIMENT_NAME}")
+  fi
 elif [[ "${MODE}" == "score-point-reward-task" ]]; then
   if [[ -z "${REWARD_NAME}" || -z "${TASK_ID}" ]]; then
     echo "REWARD_NAME and TASK_ID are required for MODE=score-point-reward-task" >&2

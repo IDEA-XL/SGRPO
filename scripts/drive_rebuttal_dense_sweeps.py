@@ -39,6 +39,7 @@ GPU_TASKS_PER_GROUP_PER_ROUND = 4
 POLL_SECONDS = 60
 COMPLETED_OUTPUT_GRACE_SECONDS = 180
 DOMAIN_ENV = "REBUTTAL_DOMAINS"
+PROGEN2_PACKED_BY_EXPERIMENT_ENV = "PROGEN2_PACKED_BY_EXPERIMENT"
 SUPPORTED_DOMAINS = ("denovo", "mmgenmol", "progen2")
 
 DOCKING_CACHE_DIR = Path(
@@ -115,6 +116,57 @@ def _nonempty_file(path: Path) -> bool:
     return path.is_file() and path.stat().st_size > 0
 
 
+def _packed_reward_experiment_path(
+    config: dict,
+    reward_name: str,
+    experiment_name: str,
+) -> Path:
+    if (
+        not experiment_name
+        or Path(experiment_name).name != experiment_name
+        or experiment_name in {".", ".."}
+    ):
+        raise ValueError(
+            f"Unsafe experiment name for packed reward path: {experiment_name!r}"
+        )
+    key = f"packed_{reward_name}_scores_path"
+    if reward_name not in {"naturalness", "stability"} or key not in config:
+        raise ValueError(f"Unsupported packed reward: {reward_name!r}")
+    base_path = Path(config[key])
+    return (
+        base_path.parent
+        / "by_experiment"
+        / experiment_name
+        / base_path.name
+    )
+
+
+def _packed_reward_output_valid(
+    output_path: Path,
+    reward_name: str,
+    experiment_names: tuple[str, ...],
+    task_ids: tuple[int, ...],
+) -> bool:
+    summary_path = Path(f"{output_path}.summary.json")
+    if not _nonempty_file(output_path) or not _nonempty_file(summary_path):
+        return False
+    try:
+        summary = json.loads(summary_path.read_text())
+        output_bytes = output_path.stat().st_size
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(summary, dict)
+        and summary.get("schema_version") == 1
+        and summary.get("reward_name") == reward_name
+        and summary.get("experiments") == list(experiment_names)
+        and summary.get("task_ids") == list(task_ids)
+        and isinstance(summary.get("num_output_rows"), int)
+        and summary["num_output_rows"] > 0
+        and summary.get("output_bytes") == output_bytes
+    )
+
+
 def _molecule_checkpoint_ready(path: Path) -> bool:
     if not _nonempty_file(path):
         return False
@@ -181,6 +233,7 @@ def _clean_submission_environment() -> dict[str, str]:
     for name in (
         "CONFIG_PATH",
         "DOCKING_ROOT",
+        "EXPERIMENT_NAME",
         "MODE",
         "OUTPUT_DIR",
         "OUTPUT_ROOT",
@@ -240,6 +293,16 @@ def _active_domains() -> tuple[str, ...]:
     if len(set(domains)) != len(domains):
         raise ValueError(f"{DOMAIN_ENV} contains duplicate domains: {domains}")
     return domains
+
+
+def _split_progen2_packed_rewards() -> bool:
+    raw_value = os.environ.get(PROGEN2_PACKED_BY_EXPERIMENT_ENV, "0")
+    if raw_value not in {"0", "1"}:
+        raise ValueError(
+            f"{PROGEN2_PACKED_BY_EXPERIMENT_ENV} must be 0 or 1, "
+            f"got {raw_value!r}"
+        )
+    return raw_value == "1"
 
 
 def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, ...]]:
@@ -454,6 +517,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
         )
 
     progen2_aggregate_keys = []
+    split_progen2_packed = _split_progen2_packed_rewards()
     for seed in SEEDS:
         config_path = SPEC_ROOT / f"progen2/seed{seed}.yaml"
         config = yaml.safe_load(config_path.read_text())
@@ -479,40 +543,41 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 exports=(("CONFIG_PATH", str(config_path)), ("MODE", "generate-task")),
             ),
         )
-        _add_group(
-            groups,
-            GroupSpec(
-                name=naturalness_group,
-                resource="gpu",
-                script=gpu_script,
-                job_name=f"rbp2n{seed}",
-                output_pattern=LOG_ROOT / f"p2_naturalness_seed{seed}_%j.out",
-                error_pattern=LOG_ROOT / f"p2_naturalness_seed{seed}_%j.err",
-                time_limit="01:00:00",
-                exports=(
-                    ("CONFIG_PATH", str(config_path)),
-                    ("MODE", "score-packed-gpu-reward"),
-                    ("REWARD_NAME", "naturalness"),
+        if not split_progen2_packed:
+            _add_group(
+                groups,
+                GroupSpec(
+                    name=naturalness_group,
+                    resource="gpu",
+                    script=gpu_script,
+                    job_name=f"rbp2n{seed}",
+                    output_pattern=LOG_ROOT / f"p2_naturalness_seed{seed}_%j.out",
+                    error_pattern=LOG_ROOT / f"p2_naturalness_seed{seed}_%j.err",
+                    time_limit="01:00:00",
+                    exports=(
+                        ("CONFIG_PATH", str(config_path)),
+                        ("MODE", "score-packed-gpu-reward"),
+                        ("REWARD_NAME", "naturalness"),
+                    ),
                 ),
-            ),
-        )
-        _add_group(
-            groups,
-            GroupSpec(
-                name=stability_group,
-                resource="gpu",
-                script=gpu_script,
-                job_name=f"rbp2s{seed}",
-                output_pattern=LOG_ROOT / f"p2_stability_seed{seed}_%j.out",
-                error_pattern=LOG_ROOT / f"p2_stability_seed{seed}_%j.err",
-                time_limit="01:00:00",
-                exports=(
-                    ("CONFIG_PATH", str(config_path)),
-                    ("MODE", "score-packed-gpu-reward"),
-                    ("REWARD_NAME", "stability"),
+            )
+            _add_group(
+                groups,
+                GroupSpec(
+                    name=stability_group,
+                    resource="gpu",
+                    script=gpu_script,
+                    job_name=f"rbp2s{seed}",
+                    output_pattern=LOG_ROOT / f"p2_stability_seed{seed}_%j.out",
+                    error_pattern=LOG_ROOT / f"p2_stability_seed{seed}_%j.err",
+                    time_limit="01:00:00",
+                    exports=(
+                        ("CONFIG_PATH", str(config_path)),
+                        ("MODE", "score-packed-gpu-reward"),
+                        ("REWARD_NAME", "stability"),
+                    ),
                 ),
-            ),
-        )
+            )
         _add_group(
             groups,
             GroupSpec(
@@ -569,6 +634,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
         )
 
         generation_keys = []
+        generation_keys_by_experiment: dict[str, list[str]] = {}
         foldability_keys = []
         developability_keys = []
         diversity_keys = []
@@ -579,6 +645,9 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
             developability_key = f"p2:{seed}:developability:{task_id}"
             diversity_key = f"p2:{seed}:diversity:{task_id}"
             generation_keys.append(generation_key)
+            generation_keys_by_experiment.setdefault(
+                row["experiment"], []
+            ).append(generation_key)
             foldability_keys.append(foldability_key)
             developability_keys.append(developability_key)
             diversity_keys.append(diversity_key)
@@ -634,32 +703,159 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 ),
             )
 
-        naturalness_key = f"p2:{seed}:naturalness"
-        stability_key = f"p2:{seed}:stability"
-        _add_task(
-            tasks,
-            TaskSpec(
-                key=naturalness_key,
-                group=naturalness_group,
-                array_id=None,
-                prerequisites=tuple(generation_keys),
-                validator=lambda path=Path(
-                    config["packed_naturalness_scores_path"]
-                ): _nonempty_file(path),
-            ),
-        )
-        _add_task(
-            tasks,
-            TaskSpec(
-                key=stability_key,
-                group=stability_group,
-                array_id=None,
-                prerequisites=tuple(generation_keys),
-                validator=lambda path=Path(
-                    config["packed_stability_scores_path"]
-                ): _nonempty_file(path),
-            ),
-        )
+        if split_progen2_packed:
+            experiment_names = tuple(
+                experiment["name"] for experiment in config["experiments"]
+            )
+            if set(experiment_names) != set(generation_keys_by_experiment):
+                raise ValueError(
+                    "ProGen2 configured experiments do not match task rows: "
+                    f"config={experiment_names} "
+                    f"tasks={tuple(generation_keys_by_experiment)}"
+                )
+            packed_reward_keys = []
+            for experiment_index, experiment_name in enumerate(experiment_names):
+                experiment_rows = [
+                    row for row in rows if row["experiment"] == experiment_name
+                ]
+                experiment_task_ids = tuple(
+                    sorted(int(row["task_id"]) for row in experiment_rows)
+                )
+                for reward_name, reward_code in (
+                    ("naturalness", "n"),
+                    ("stability", "s"),
+                ):
+                    group_name = (
+                        f"progen2_{reward_name}_{seed}_{experiment_name}"
+                    )
+                    output_path = _packed_reward_experiment_path(
+                        config,
+                        reward_name,
+                        experiment_name,
+                    )
+                    _add_group(
+                        groups,
+                        GroupSpec(
+                            name=group_name,
+                            resource="gpu",
+                            script=gpu_script,
+                            job_name=(
+                                f"rbp2{reward_code}{seed}e{experiment_index}"
+                            ),
+                            output_pattern=LOG_ROOT
+                            / (
+                                f"p2_{reward_name}_seed{seed}_"
+                                f"{experiment_name}_%j.out"
+                            ),
+                            error_pattern=LOG_ROOT
+                            / (
+                                f"p2_{reward_name}_seed{seed}_"
+                                f"{experiment_name}_%j.err"
+                            ),
+                            time_limit="01:00:00",
+                            exports=(
+                                ("CONFIG_PATH", str(config_path)),
+                                ("MODE", "score-packed-gpu-reward"),
+                                ("REWARD_NAME", reward_name),
+                                ("EXPERIMENT_NAME", experiment_name),
+                            ),
+                        ),
+                    )
+                    reward_key = (
+                        f"p2:{seed}:{reward_name}:{experiment_name}"
+                    )
+                    packed_reward_keys.append(reward_key)
+                    _add_task(
+                        tasks,
+                        TaskSpec(
+                            key=reward_key,
+                            group=group_name,
+                            array_id=None,
+                            prerequisites=tuple(
+                                generation_keys_by_experiment[experiment_name]
+                            ),
+                            validator=lambda path=output_path,
+                            reward=reward_name,
+                            experiment=experiment_name,
+                            ids=experiment_task_ids: _packed_reward_output_valid(
+                                path,
+                                reward,
+                                (experiment,),
+                                ids,
+                            ),
+                        ),
+                    )
+
+            packed_merge_group = f"progen2_packed_merge_{seed}"
+            _add_group(
+                groups,
+                GroupSpec(
+                    name=packed_merge_group,
+                    resource="cpu",
+                    script=REPO_REMOTE_ROOT
+                    / "scripts/slurm/run_progen2_sweep_merge_cpu.sbatch",
+                    job_name=f"rbp2m{seed}",
+                    output_pattern=LOG_ROOT
+                    / f"p2_packed_merge_seed{seed}_%j.out",
+                    error_pattern=LOG_ROOT
+                    / f"p2_packed_merge_seed{seed}_%j.err",
+                    exports=(("CONFIG_PATH", str(config_path)),),
+                ),
+            )
+            packed_merge_key = f"p2:{seed}:packed_merge"
+            all_task_ids = tuple(sorted(int(row["task_id"]) for row in rows))
+            _add_task(
+                tasks,
+                TaskSpec(
+                    key=packed_merge_key,
+                    group=packed_merge_group,
+                    array_id=None,
+                    prerequisites=tuple(packed_reward_keys),
+                    validator=_all_valid(
+                        (
+                            lambda reward=reward_name,
+                            path=Path(config[f"packed_{reward_name}_scores_path"]),
+                            experiments=experiment_names,
+                            ids=all_task_ids: _packed_reward_output_valid(
+                                path,
+                                reward,
+                                experiments,
+                                ids,
+                            )
+                        )
+                        for reward_name in ("naturalness", "stability")
+                    ),
+                ),
+            )
+            packed_prerequisites = (packed_merge_key,)
+        else:
+            naturalness_key = f"p2:{seed}:naturalness"
+            stability_key = f"p2:{seed}:stability"
+            _add_task(
+                tasks,
+                TaskSpec(
+                    key=naturalness_key,
+                    group=naturalness_group,
+                    array_id=None,
+                    prerequisites=tuple(generation_keys),
+                    validator=lambda path=Path(
+                        config["packed_naturalness_scores_path"]
+                    ): _nonempty_file(path),
+                ),
+            )
+            _add_task(
+                tasks,
+                TaskSpec(
+                    key=stability_key,
+                    group=stability_group,
+                    array_id=None,
+                    prerequisites=tuple(generation_keys),
+                    validator=lambda path=Path(
+                        config["packed_stability_scores_path"]
+                    ): _nonempty_file(path),
+                ),
+            )
+            packed_prerequisites = (naturalness_key, stability_key)
         aggregate_key = f"p2:{seed}:aggregate"
         progen2_aggregate_keys.append(aggregate_key)
         expected_progen2_rows = len(rows)
@@ -670,8 +866,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 group=aggregate_group,
                 array_id=None,
                 prerequisites=(
-                    naturalness_key,
-                    stability_key,
+                    *packed_prerequisites,
                     *foldability_keys,
                     *developability_keys,
                     *diversity_keys,

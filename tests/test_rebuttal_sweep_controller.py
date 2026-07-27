@@ -1,9 +1,12 @@
+import csv
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import yaml
 
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1] / "scripts"
@@ -251,6 +254,160 @@ class RebuttalSweepControllerTest(unittest.TestCase):
         ]
         self.assertEqual(submitted_names, ["first", "second"])
         self.assertEqual(state["gpu_group_cursor"], "third")
+
+    def test_split_packed_rewards_depend_only_on_same_experiment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec_root = root / "specs"
+            denovo_config = spec_root / "denovo/config.yaml"
+            denovo_config.parent.mkdir(parents=True)
+            denovo_config.write_text(
+                yaml.safe_dump(
+                    {
+                        "output_json_path": str(root / "denovo.json"),
+                        "randomness_temperature_pairs": [
+                            {
+                                "randomness": 0.1,
+                                "generation_temperature": 0.5,
+                            }
+                        ],
+                        "experiments": [
+                            {
+                                "checkpoint_path": str(
+                                    root / "denovo-checkpoint/model.ckpt"
+                                )
+                            }
+                        ],
+                    }
+                )
+            )
+            with (spec_root / "denovo/tasks.tsv").open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=("task_id", "seed", "config_path"),
+                    delimiter="\t",
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "task_id": 0,
+                        "seed": 42,
+                        "config_path": denovo_config,
+                    }
+                )
+
+            mm_path = spec_root / "mmgenmol/seed42.tsv"
+            mm_path.parent.mkdir(parents=True)
+            with mm_path.open("w", newline="") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=(
+                        "task_id",
+                        "model_name",
+                        "sweep_type",
+                        "sweep_value",
+                        "checkpoint_path",
+                        "output_path",
+                    ),
+                    delimiter="\t",
+                )
+                writer.writeheader()
+                writer.writerow(
+                    {
+                        "task_id": 0,
+                        "model_name": "model",
+                        "sweep_type": "paired",
+                        "sweep_value": 1,
+                        "checkpoint_path": root / "mm-checkpoint/model.ckpt",
+                        "output_path": root / "mm-generated.jsonl",
+                    }
+                )
+
+            progen2_config_path = spec_root / "progen2/seed42.yaml"
+            progen2_config_path.parent.mkdir(parents=True)
+            progen2_config = {
+                "packed_naturalness_scores_path": str(
+                    root / "naturalness/naturalness.rows.jsonl"
+                ),
+                "packed_stability_scores_path": str(
+                    root / "stability/stability.rows.jsonl"
+                ),
+                "output_json_path": str(root / "progen2.json"),
+                "experiments": [
+                    {"name": "dmb"},
+                    {"name": "entropy"},
+                ],
+            }
+            progen2_config_path.write_text(yaml.safe_dump(progen2_config))
+            p2_tasks_path = spec_root / "progen2/seed42_tasks.tsv"
+            with p2_tasks_path.open("w", newline="") as handle:
+                fieldnames = (
+                    "task_id",
+                    "experiment",
+                    "checkpoint_dir",
+                    "generation_rows_path",
+                    "foldability_scores_path",
+                    "developability_scores_path",
+                    "diversity_scores_path",
+                )
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=fieldnames,
+                    delimiter="\t",
+                )
+                writer.writeheader()
+                for task_id, experiment in enumerate(("dmb", "entropy")):
+                    writer.writerow(
+                        {
+                            "task_id": task_id,
+                            "experiment": experiment,
+                            "checkpoint_dir": root / f"{experiment}-checkpoint",
+                            "generation_rows_path": root
+                            / f"{experiment}-generated.jsonl",
+                            "foldability_scores_path": root
+                            / f"{experiment}-foldability.jsonl",
+                            "developability_scores_path": root
+                            / f"{experiment}-developability.jsonl",
+                            "diversity_scores_path": root
+                            / f"{experiment}-diversity.json",
+                        }
+                    )
+
+            with (
+                mock.patch.object(controller, "SEEDS", (42,)),
+                mock.patch.object(controller, "SPEC_ROOT", spec_root),
+                mock.patch.object(controller, "RUN_OUTPUT_ROOT", root),
+                mock.patch.object(controller, "LOG_ROOT", root / "logs"),
+                mock.patch.object(controller, "REPO_REMOTE_ROOT", root / "repo"),
+                mock.patch.dict(
+                    "os.environ",
+                    {controller.PROGEN2_PACKED_BY_EXPERIMENT_ENV: "1"},
+                ),
+            ):
+                groups, tasks, _ = controller._build_dag()
+
+            self.assertEqual(
+                tasks["p2:42:naturalness:dmb"].prerequisites,
+                ("p2:42:generation:0",),
+            )
+            self.assertEqual(
+                tasks["p2:42:naturalness:entropy"].prerequisites,
+                ("p2:42:generation:1",),
+            )
+            self.assertEqual(
+                set(tasks["p2:42:packed_merge"].prerequisites),
+                {
+                    "p2:42:naturalness:dmb",
+                    "p2:42:stability:dmb",
+                    "p2:42:naturalness:entropy",
+                    "p2:42:stability:entropy",
+                },
+            )
+            self.assertEqual(
+                groups["progen2_naturalness_42_entropy"].exports[-1],
+                ("EXPERIMENT_NAME", "entropy"),
+            )
+            self.assertNotIn("p2:42:naturalness", tasks)
 
 
 if __name__ == "__main__":

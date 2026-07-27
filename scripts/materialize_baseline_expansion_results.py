@@ -17,6 +17,7 @@ DEFAULT_RUN_ROOT = Path(
     "/public/home/xinwuye/ai4s-tool-joint-train/runs/baseline_expansion_sweep"
 )
 SEEDS = (42, 43, 44, 45, 46)
+REQUIRED_DOMAINS = ("denovo", "mmgenmol", "progen2")
 
 
 def _parse_args() -> argparse.Namespace:
@@ -105,6 +106,27 @@ def materialize(run_root: Path, output_root: Path) -> Path:
         raise FileNotFoundError(
             f"Sweep controller has not produced its completion marker: {complete_path}"
         )
+    controller_state_path = run_root / "controller_state.json"
+    if not controller_state_path.is_file():
+        raise FileNotFoundError(
+            f"Missing sweep controller state: {controller_state_path}"
+        )
+    controller_state = json.loads(controller_state_path.read_text())
+    if controller_state.get("status") != "complete":
+        raise RuntimeError(
+            f"Sweep controller state is not complete: "
+            f"{controller_state.get('status')!r}"
+        )
+    active_domains = controller_state.get("active_domains")
+    if (
+        not isinstance(active_domains, list)
+        or set(active_domains) != set(REQUIRED_DOMAINS)
+        or len(active_domains) != len(REQUIRED_DOMAINS)
+    ):
+        raise RuntimeError(
+            f"Materialization requires all domains {REQUIRED_DOMAINS}; "
+            f"controller completed {active_domains!r}"
+        )
     if output_root.exists():
         raise FileExistsError(
             f"Refusing to mix materialized results in existing path: {output_root}"
@@ -117,7 +139,7 @@ def materialize(run_root: Path, output_root: Path) -> Path:
         raise FileExistsError(f"Temporary output already exists: {temporary_root}")
     temporary_root.mkdir(parents=True)
     try:
-        for domain in ("denovo", "mmgenmol", "progen2"):
+        for domain in REQUIRED_DOMAINS:
             for seed in SEEDS:
                 source = _source_path(run_root, domain, seed)
                 actual_count = _validated_row_count(source, domain)

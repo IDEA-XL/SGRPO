@@ -77,6 +77,14 @@ class MaterializeBaselineExpansionResultsTest(unittest.TestCase):
                 source.write_text(json.dumps(value))
         _write_tsv(spec_root / "denovo/tasks.tsv", denovo_rows)
         (run_root / "COMPLETE").write_text("2026-07-27T00:00:00+0000\n")
+        (run_root / "controller_state.json").write_text(
+            json.dumps(
+                {
+                    "status": "complete",
+                    "active_domains": list(materializer.REQUIRED_DOMAINS),
+                }
+            )
+        )
         return run_root
 
     def test_materializes_all_seed_summaries_with_hashes(self):
@@ -115,6 +123,22 @@ class MaterializeBaselineExpansionResultsTest(unittest.TestCase):
             (run_root / "COMPLETE").unlink()
 
             with self.assertRaisesRegex(FileNotFoundError, "completion marker"):
+                materializer.materialize(run_root, root / "output")
+
+    def test_rejects_partial_domain_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            run_root = self._build_run_root(root)
+            (run_root / "controller_state.json").write_text(
+                json.dumps(
+                    {
+                        "status": "complete",
+                        "active_domains": ["denovo", "mmgenmol"],
+                    }
+                )
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "requires all domains"):
                 materializer.materialize(run_root, root / "output")
 
 

@@ -232,10 +232,34 @@ def main() -> None:
         raise RuntimeError(
             f"Could not parse controller job ID from {result.stdout!r}"
         )
+    materialize_command = [
+        str(SBATCH),
+        "--parsable",
+        "--exclude=server13,server59",
+        f"--dependency=afterok:{controller_job_id}",
+        str(
+            REPO_ROOT
+            / "scripts/slurm/materialize_baseline_expansion_results_cpu.sbatch"
+        ),
+    ]
+    materialize_result = subprocess.run(
+        materialize_command,
+        cwd=REPO_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    materialize_job_id = materialize_result.stdout.strip().split(";", 1)[0]
+    if not materialize_job_id.isdigit():
+        raise RuntimeError(
+            "Could not parse materialization job ID from "
+            f"{materialize_result.stdout!r}"
+        )
     print("Resolved checkpoints:")
     for name, checkpoint in checkpoints.items():
         print(f"  {name}: {checkpoint}")
     print(f"Submitted baseline expansion sweep controller: {controller_job_id}")
+    print(f"Submitted baseline expansion materialization job: {materialize_job_id}")
 
 
 if __name__ == "__main__":

@@ -63,6 +63,59 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'non-finite grad_norm'):
                 monitor._read_metrics(self._entropy_spec(metrics_path))
 
+    def test_running_job_ignores_incomplete_final_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            base = {
+                'reward_mean': 0.5,
+                'grad_norm': 0.25,
+                'entropy/normalized_mean': 0.75,
+            }
+            _write_metrics(metrics_path, [{'step': 1, **base}])
+            with metrics_path.open('a') as handle:
+                handle.write('{"step": 2,\n')
+
+            result = monitor._read_metrics(
+                self._entropy_spec(metrics_path),
+                allow_partial_tail=True,
+            )
+
+        self.assertEqual(result['max_step'], 1)
+
+    def test_terminal_job_rejects_incomplete_final_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            base = {
+                'reward_mean': 0.5,
+                'grad_norm': 0.25,
+                'entropy/normalized_mean': 0.75,
+            }
+            _write_metrics(metrics_path, [{'step': 1, **base}])
+            with metrics_path.open('a') as handle:
+                handle.write('{"step": 2,\n')
+
+            with self.assertRaisesRegex(RuntimeError, 'Invalid JSON'):
+                monitor._read_metrics(self._entropy_spec(metrics_path))
+
+    def test_running_job_rejects_invalid_nonfinal_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics_path = Path(directory) / 'metrics.jsonl'
+            base = {
+                'reward_mean': 0.5,
+                'grad_norm': 0.25,
+                'entropy/normalized_mean': 0.75,
+            }
+            _write_metrics(metrics_path, [{'step': 1, **base}])
+            with metrics_path.open('a') as handle:
+                handle.write('{"step": 2,\n')
+                handle.write(json.dumps({'step': 3, **base}) + '\n')
+
+            with self.assertRaisesRegex(RuntimeError, 'Invalid JSON'):
+                monitor._read_metrics(
+                    self._entropy_spec(metrics_path),
+                    allow_partial_tail=True,
+                )
+
     def test_dmb_valid_candidate_shortfall_is_accepted(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'

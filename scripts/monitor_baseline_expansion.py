@@ -269,7 +269,11 @@ def _finite_metric(row: dict, key: str, *, context: str) -> float:
     return value
 
 
-def _read_metrics(spec: JobSpec) -> dict:
+def _read_metrics(
+    spec: JobSpec,
+    *,
+    allow_partial_tail: bool = False,
+) -> dict:
     path = _resolve_metrics_path(spec)
     if path is None:
         return {
@@ -281,13 +285,24 @@ def _read_metrics(spec: JobSpec) -> dict:
 
     rows_by_step: dict[int, dict] = {}
     lines = path.read_text(errors="replace").splitlines(keepends=True)
+    nonempty_line_numbers = [
+        line_number
+        for line_number, line in enumerate(lines, start=1)
+        if line.strip()
+    ]
+    last_nonempty_line_number = (
+        nonempty_line_numbers[-1] if nonempty_line_numbers else None
+    )
     for line_number, line in enumerate(lines, start=1):
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError as exc:
-            if line_number == len(lines) and not line.endswith("\n"):
+            if (
+                allow_partial_tail
+                and line_number == last_nonempty_line_number
+            ):
                 break
             raise RuntimeError(
                 f"Invalid JSON in {path}:{line_number}: {exc}"
@@ -500,7 +515,10 @@ def _poll(
 
     for spec in specs:
         record = records[spec.job_id]
-        metrics = _read_metrics(spec)
+        metrics = _read_metrics(
+            spec,
+            allow_partial_tail=record["state"] not in TERMINAL_STATES,
+        )
         previous = runtime["jobs"].get(spec.name, {})
         previous_state = previous.get("state")
         previous_step = int(previous.get("max_step", 0))

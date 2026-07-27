@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 
 import render_rebuttal_dense_results as dense
@@ -13,6 +14,14 @@ import render_rebuttal_dense_results as dense
 PROGEN2_TEMPERATURES = tuple(round(index / 10.0, 1) for index in range(1, 13))
 COLOR_DMB = "#6B5B95"
 COLOR_ENTROPY = "#C85A3E"
+RESULT_SECTION_PATTERN = re.compile(
+    r"(?P<section>"
+    r"<!-- BEGIN (?P<label>[A-Z0-9 _-]+) RESULTS -->\n"
+    r".*?"
+    r"<!-- END (?P=label) RESULTS -->\n?"
+    r")",
+    re.DOTALL,
+)
 
 PANELS = (
     dense.PanelSpec(
@@ -242,6 +251,7 @@ def _write_markdown(
     metrics: dict[str, dict[str, tuple[float, float]]],
     references: dict[str, list[dense.Point]],
 ) -> None:
+    preserved_sections = _preserved_result_sections(output_path)
     molecule_points = ", ".join(
         f"({randomness:g}, {temperature:g})"
         for randomness, temperature in dense.MOLECULE_SWEEP
@@ -269,8 +279,35 @@ def _write_markdown(
     group_result = dense._hyperparameter_hv(store, dense.GROUP_SIZE_SPECS)
     weight_result = dense._hyperparameter_hv(store, dense.DIVERSITY_WEIGHT_SPECS)
     dense._append_figure5_tables(lines, group_result, weight_result)
+    for section in preserved_sections:
+        lines.extend(["", section.rstrip()])
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines) + "\n")
+
+
+def _preserved_result_sections(output_path: Path) -> list[str]:
+    if not output_path.exists():
+        return []
+    text = output_path.read_text()
+    begin_labels = re.findall(
+        r"<!-- BEGIN ([A-Z0-9 _-]+) RESULTS -->",
+        text,
+    )
+    end_labels = re.findall(
+        r"<!-- END ([A-Z0-9 _-]+) RESULTS -->",
+        text,
+    )
+    if begin_labels != end_labels or len(begin_labels) != len(set(begin_labels)):
+        raise RuntimeError(
+            f"Malformed or duplicate marked result sections in {output_path}: "
+            f"begins={begin_labels}, ends={end_labels}"
+        )
+    sections = [match.group("section") for match in RESULT_SECTION_PATTERN.finditer(text)]
+    if len(sections) != len(begin_labels):
+        raise RuntimeError(
+            f"Could not parse every marked result section in {output_path}"
+        )
+    return sections
 
 
 def _parse_args() -> argparse.Namespace:

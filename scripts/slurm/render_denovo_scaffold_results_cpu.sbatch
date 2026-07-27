@@ -12,8 +12,7 @@ set -euo pipefail
 
 REPO_DIR=/public/home/xinwuye/ai4s-tool-joint-train/genmol
 RUN_ROOT=/public/home/xinwuye/ai4s-tool-joint-train/runs/denovo_scaffold_sweep
-OUTPUT_DIR=/public/home/xinwuye/ai4s-tool-joint-train/nips26/rebuttal
-EXPANDED_RESULTS_PATH=${OUTPUT_DIR}/expanded-sweep-results.md
+OUTPUT_DIR=${RUN_ROOT}/results
 
 source /public/home/xinwuye/miniconda/etc/profile.d/conda.sh
 conda activate genmol
@@ -21,5 +20,4 @@ conda activate genmol
 cd "${REPO_DIR}"
 python -u vis-code/render_denovo_scaffold_results.py \
   --run-root "${RUN_ROOT}" \
-  --output-dir "${OUTPUT_DIR}" \
-  --expanded-results-path "${EXPANDED_RESULTS_PATH}"
+  --output-dir "${OUTPUT_DIR}"

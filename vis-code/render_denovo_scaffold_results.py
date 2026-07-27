@@ -178,7 +178,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--expanded-results-path", type=Path, required=True)
+    parser.add_argument("--expanded-results-path", type=Path)
     return parser.parse_args()
 
 
@@ -199,10 +199,11 @@ def main() -> None:
     _plot_figure2(store, figure_path)
     section = _result_section(store, metrics, references, figure_path.name)
     standalone_path.write_text("# Scaffold Diversity Results\n\n" + section)
-    _upsert_section(args.expanded_results_path, section)
     print(figure_path)
     print(standalone_path)
-    print(args.expanded_results_path)
+    if args.expanded_results_path is not None:
+        _upsert_section(args.expanded_results_path, section)
+        print(args.expanded_results_path)
 
 
 if __name__ == "__main__":

@@ -165,7 +165,7 @@ def _resolve_temperature_values(raw):
     return [float(value) for value in values]
 
 
-def load_config(path):
+def load_config(path, *, validate_checkpoint_dirs=True):
     with open(path) as handle:
         raw = yaml.safe_load(handle)
     if not isinstance(raw, dict):
@@ -205,8 +205,8 @@ def load_config(path):
         if temperature <= 0.0:
             raise ValueError(f'all temperature_values must be positive, got {temperature}')
     for experiment in config.experiments:
-        if not os.path.isdir(experiment.checkpoint_dir):
-            raise FileNotFoundError(f'checkpoint_dir not found: {experiment.checkpoint_dir}')
+        if validate_checkpoint_dirs:
+            _validate_checkpoint_dir(experiment.checkpoint_dir)
         normalize_protein_reward_weights(
             {
                 'naturalness': experiment.naturalness,
@@ -216,6 +216,11 @@ def load_config(path):
             }
         )
     return config
+
+
+def _validate_checkpoint_dir(checkpoint_dir):
+    if not os.path.isdir(checkpoint_dir):
+        raise FileNotFoundError(f'checkpoint_dir not found: {checkpoint_dir}')
 
 
 def resolve_device(device_name):
@@ -910,11 +915,12 @@ def cmd_build_tasks(args):
 
 
 def cmd_generate_task(args):
-    config = load_config(args.config)
+    config = load_config(args.config, validate_checkpoint_dirs=False)
     tasks = _load_point_tasks(config.tasks_path)
     task = next((task for task in tasks if int(task['task_id']) == args.task_id), None)
     if task is None:
         raise ValueError(f'No task found for task_id={args.task_id}')
+    _validate_checkpoint_dir(task['checkpoint_dir'])
     prompts = load_prompt_texts(config.prompt_path)
     device = resolve_device(config.device)
     policy = _instantiate_policy(task, config, device)
@@ -954,7 +960,7 @@ def cmd_score_packed_gpu_reward(args):
 
 
 def cmd_score_point_reward_task(args):
-    config = load_config(args.config)
+    config = load_config(args.config, validate_checkpoint_dirs=False)
     tasks = _load_point_tasks(config.tasks_path)
     task = next((task for task in tasks if int(task['task_id']) == args.task_id), None)
     if task is None:
@@ -970,7 +976,7 @@ def cmd_score_point_reward_task(args):
 
 
 def cmd_score_point_diversity_task(args):
-    config = load_config(args.config)
+    config = load_config(args.config, validate_checkpoint_dirs=False)
     tasks = _load_point_tasks(config.tasks_path)
     task = next((task for task in tasks if int(task['task_id']) == args.task_id), None)
     if task is None:
@@ -980,7 +986,7 @@ def cmd_score_point_diversity_task(args):
 
 
 def cmd_aggregate(args):
-    config = load_config(args.config)
+    config = load_config(args.config, validate_checkpoint_dirs=False)
     tasks = _load_point_tasks(config.tasks_path)
     all_rows, point_results = _aggregate_results(config, tasks)
 

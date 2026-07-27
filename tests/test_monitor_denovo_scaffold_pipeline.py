@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +63,54 @@ class MonitorDenovoScaffoldPipelineTest(unittest.TestCase):
             result = monitor._read_metrics(path, allow_partial_tail=True)
 
         self.assertEqual(result["max_step"], 1)
+
+    def test_running_job_retries_transient_interior_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.jsonl"
+            path.write_text("placeholder\n")
+            partial_snapshot = (
+                json.dumps(_metric(1)) + "\n"
+                + "temporarily unreadable\n"
+                + json.dumps(_metric(2)) + "\n"
+            )
+            complete_snapshot = (
+                json.dumps(_metric(1)) + "\n"
+                + json.dumps(_metric(2)) + "\n"
+            )
+            with (
+                mock.patch.object(
+                    Path,
+                    "read_text",
+                    side_effect=[partial_snapshot, complete_snapshot],
+                ),
+                mock.patch.object(monitor.time, "sleep") as sleep,
+            ):
+                result = monitor._read_metrics(path, allow_partial_tail=True)
+
+        self.assertEqual(result["max_step"], 2)
+        sleep.assert_called_once_with(monitor.METRICS_READ_RETRY_SECONDS)
+
+    def test_running_job_rejects_persistent_interior_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "metrics.jsonl"
+            path.write_text("placeholder\n")
+            invalid_snapshot = (
+                json.dumps(_metric(1)) + "\n"
+                + "persistently invalid\n"
+                + json.dumps(_metric(2)) + "\n"
+            )
+            with (
+                mock.patch.object(
+                    Path,
+                    "read_text",
+                    return_value=invalid_snapshot,
+                ),
+                mock.patch.object(monitor.time, "sleep") as sleep,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Invalid JSON"):
+                    monitor._read_metrics(path, allow_partial_tail=True)
+
+        self.assertEqual(sleep.call_count, monitor.METRICS_READ_ATTEMPTS - 1)
 
     def test_discovers_both_pipeline_jobs(self):
         with tempfile.TemporaryDirectory() as directory:

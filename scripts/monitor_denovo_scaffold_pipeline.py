@@ -24,6 +24,8 @@ SWEEP_ROOT = RUNS_ROOT / "denovo_scaffold_sweep"
 DEFAULT_OUTPUT_DIR = RUNS_ROOT / "denovo_scaffold_monitor"
 CONTROLLER_PATTERN = re.compile(r"controller_job_id=(\d+)")
 RENDER_PATTERN = re.compile(r"render_job_id=(\d+)")
+METRICS_READ_ATTEMPTS = 3
+METRICS_READ_RETRY_SECONDS = 0.1
 
 
 def _positive_int(value: str) -> int:
@@ -71,6 +73,29 @@ def _finite(row: dict, key: str, *, context: str) -> float:
 
 
 def _read_metrics(
+    path: Path,
+    *,
+    allow_partial_tail: bool,
+) -> dict:
+    for attempt in range(METRICS_READ_ATTEMPTS):
+        try:
+            return _read_metrics_snapshot(
+                path,
+                allow_partial_tail=allow_partial_tail,
+            )
+        except RuntimeError as exc:
+            transient_read = (
+                allow_partial_tail
+                and str(exc).startswith("Invalid JSON in ")
+                and attempt + 1 < METRICS_READ_ATTEMPTS
+            )
+            if not transient_read:
+                raise
+            time.sleep(METRICS_READ_RETRY_SECONDS)
+    raise AssertionError("Unreachable metrics-read retry state")
+
+
+def _read_metrics_snapshot(
     path: Path,
     *,
     allow_partial_tail: bool,

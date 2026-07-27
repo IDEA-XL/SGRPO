@@ -9,6 +9,10 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from genmol.diversity import (
+    compute_internal_diversity,
+    compute_internal_diversity_loo_credits,
+)
 from genmol.mm.utils import DrugCLIPConfig, DrugCLIPScorer, UniDockConfig, UniDockScorer
 
 
@@ -90,73 +94,6 @@ def apply_reward_gate(soft_reward, is_valid, alert_hit):
     if alert_hit:
         return 0.2 * float(soft_reward)
     return float(soft_reward)
-
-
-def compute_internal_diversity(smiles_list):
-    indexed_fingerprints = _compute_indexed_fingerprints(smiles_list)
-    if len(indexed_fingerprints) < 2:
-        return 0.0
-    similarity_sum, pair_count, _ = _compute_pairwise_similarity_stats(indexed_fingerprints)
-    if pair_count == 0:
-        return 0.0
-    return 1.0 - (similarity_sum / pair_count)
-
-
-def _compute_indexed_fingerprints(smiles_list):
-    from rdkit.Chem import MolFromSmiles, rdFingerprintGenerator
-
-    fingerprint_generator = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
-    indexed_fingerprints = []
-    for original_idx, smiles in enumerate(smiles_list):
-        if smiles is None:
-            continue
-        mol = MolFromSmiles(smiles, sanitize=True)
-        if mol is None:
-            continue
-        indexed_fingerprints.append((original_idx, fingerprint_generator.GetFingerprint(mol)))
-    return indexed_fingerprints
-
-
-def _compute_pairwise_similarity_stats(indexed_fingerprints):
-    from rdkit import DataStructs
-
-    fingerprints = [fingerprint for _, fingerprint in indexed_fingerprints]
-    similarity_sum = 0.0
-    pair_count = 0
-    per_fingerprint_similarity_sum = [0.0 for _ in fingerprints]
-    for left_idx in range(len(fingerprints)):
-        for right_idx in range(left_idx + 1, len(fingerprints)):
-            similarity = float(DataStructs.TanimotoSimilarity(fingerprints[left_idx], fingerprints[right_idx]))
-            similarity_sum += similarity
-            per_fingerprint_similarity_sum[left_idx] += similarity
-            per_fingerprint_similarity_sum[right_idx] += similarity
-            pair_count += 1
-    return similarity_sum, pair_count, per_fingerprint_similarity_sum
-
-
-def compute_internal_diversity_loo_credits(smiles_list):
-    if len(smiles_list) < 2:
-        raise ValueError('LOO diversity credit requires at least two rollouts')
-
-    indexed_fingerprints = _compute_indexed_fingerprints(smiles_list)
-    if len(indexed_fingerprints) < 2:
-        return [0.0 for _ in smiles_list]
-
-    similarity_sum, pair_count, per_fingerprint_similarity_sum = _compute_pairwise_similarity_stats(indexed_fingerprints)
-    full_diversity = 1.0 - (similarity_sum / pair_count)
-    credits = [0.0 for _ in smiles_list]
-    valid_count = len(indexed_fingerprints)
-    reduced_count = valid_count - 1
-    reduced_pair_count = reduced_count * (reduced_count - 1) // 2
-
-    for fingerprint_idx, (original_idx, _) in enumerate(indexed_fingerprints):
-        if reduced_pair_count == 0:
-            reduced_diversity = 0.0
-        else:
-            reduced_similarity_sum = similarity_sum - per_fingerprint_similarity_sum[fingerprint_idx]
-            reduced_diversity = 1.0 - (reduced_similarity_sum / reduced_pair_count)
-        credits[original_idx] = full_diversity - reduced_diversity
-    return credits
 
 
 @dataclass(frozen=True)

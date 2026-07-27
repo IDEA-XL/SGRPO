@@ -13,6 +13,12 @@ import yaml
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
+from genmol.diversity import (
+    DEFAULT_DIVERSITY_METRIC,
+    compute_molecular_diversity,
+    compute_molecular_diversity_with_loo_credits,
+    validate_diversity_metric,
+)
 from genmol.rl.cpgrpo import (
     VALID_GROUP_REWRAD_CREDITS,
     VALID_SGRPO_HIERARCHIES,
@@ -30,8 +36,6 @@ from genmol.rl.reward import (
     MOLECULAR_REWARD_NAME_ORDER,
     MolecularReward,
     RewardRecord,
-    compute_internal_diversity,
-    compute_internal_diversity_loo_credits,
     normalize_molecular_reward_weights,
 )
 from genmol.rl.specs import (
@@ -104,6 +108,7 @@ class TrainConfig:
     supergroup_num_groups: int = 1
     group_advantage_weight: float = 0.5
     diversity_regularizer_weight: float = 0.0
+    diversity_metric: str = DEFAULT_DIVERSITY_METRIC
     hierarchy: str = 'advantage_sum'
     qed: float | None = None
     sa_score: float | None = None
@@ -166,6 +171,7 @@ def load_config(path):
         raise ValueError('group_advantage_weight must be in [0, 1]')
     if config.diversity_regularizer_weight < 0.0:
         raise ValueError('diversity_regularizer_weight must be non-negative')
+    config.diversity_metric = validate_diversity_metric(config.diversity_metric)
     config.diverse_minibatch_oversample_factor = validate_diverse_minibatch_config(
         enabled=config.diverse_minibatch,
         oversample_factor=config.diverse_minibatch_oversample_factor,
@@ -965,11 +971,18 @@ class GenMolCpGRPOTrainer:
             group_diversity_credits = []
             for group_start in range(0, len(global_smiles), self.config.num_generations):
                 group_smiles = global_smiles[group_start:group_start + self.config.num_generations]
-                group_diversities.append(
-                    compute_internal_diversity(group_smiles)
-                )
                 if self.config.group_rewrad_credit == 'loo':
-                    group_diversity_credits.extend(compute_internal_diversity_loo_credits(group_smiles))
+                    group_diversity, credits = compute_molecular_diversity_with_loo_credits(
+                        group_smiles,
+                        metric=self.config.diversity_metric,
+                    )
+                    group_diversity_credits.extend(credits)
+                else:
+                    group_diversity = compute_molecular_diversity(
+                        group_smiles,
+                        metric=self.config.diversity_metric,
+                    )
+                group_diversities.append(group_diversity)
             global_group_rewards = torch.tensor(group_diversities, device=self.device, dtype=torch.float32)
             if self.config.group_rewrad_credit == 'loo':
                 global_group_reward_credits = torch.tensor(

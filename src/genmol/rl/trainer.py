@@ -770,6 +770,11 @@ class GenMolCpGRPOTrainer:
         ):
             if name in metadata:
                 self._last_reward_metrics[mode][name] = float(metadata[name])
+        for name, value in metadata.items():
+            if name.startswith(
+                ('diverse_minibatch/', 'motif_extension/')
+            ):
+                self._last_reward_metrics[mode][name] = float(value)
         bucket['reward'].append(float(metadata['reward_mean']))
         bucket['reward_std'].append(float(metadata['reward_std']))
         bucket['advantage_mean'].append(float(metadata['advantage_mean']))
@@ -1693,9 +1698,16 @@ class GenMolCpGRPOTrainer:
         ):
             if bucket[name] or name in last_reward_metrics:
                 metrics[name] = _reward_metric(name)
-        for name, values in bucket.items():
-            if name.startswith('diverse_minibatch/') and values:
-                metrics[name] = _aggregate_scalar_list(values)
+        optional_names = sorted(
+            name
+            for name in set(bucket) | set(last_reward_metrics)
+            if name.startswith(
+                ('diverse_minibatch/', 'motif_extension/')
+            )
+        )
+        for name in optional_names:
+            if bucket[name] or name in last_reward_metrics:
+                metrics[name] = _reward_metric(name)
         metrics['reward_mean'] = metrics['reward']
         if bucket['kl']:
             metrics['kl'] = _aggregate_scalar_list(bucket['kl'])

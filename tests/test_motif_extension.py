@@ -29,6 +29,15 @@ def test_molecule_contains_fragment_ignores_attachment_dummy():
     assert not molecule_contains_fragment("c1ccccc1", "[*:1]CCO")
 
 
+def test_molecule_contains_aromatic_n_attachment_fragment():
+    fragment = "[1*]n1[nH]c2ccccc2c1=O"
+    assert molecule_contains_fragment(
+        "Cn1[nH]c2ccccc2c1=O",
+        fragment,
+    )
+    assert not molecule_contains_fragment("c1ccccc1", fragment)
+
+
 def test_load_motif_records_is_strict_and_canonical(tmp_path):
     path = tmp_path / "motifs.jsonl"
     path.write_text(

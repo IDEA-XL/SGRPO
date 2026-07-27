@@ -80,7 +80,10 @@ def attachment_free_query(fragment_smiles: str):
     editable = Chem.RWMol(molecule)
     editable.RemoveAtom(dummy_index)
     query = editable.GetMol()
-    Chem.SanitizeMol(query)
+    # The attachment-free object is a query fragment, not a standalone
+    # molecule. Re-sanitizing can incorrectly reject aromatic attachment
+    # atoms whose missing valence is supplied by the generated extension.
+    query.UpdatePropertyCache(strict=False)
     if query.GetNumHeavyAtoms() == 0:
         raise ValueError(
             f"fragment has no non-attachment heavy atoms: {fragment_smiles!r}"

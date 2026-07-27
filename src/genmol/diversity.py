@@ -179,7 +179,11 @@ def _compute_relative_scaffold_diversity_with_loo_credits(smiles_list):
 
 
 def _compute_indexed_scaffolds(smiles_list):
-    from rdkit.Chem import MolFromSmiles, MolToSmiles
+    from rdkit.Chem import (
+        MolFromSmiles,
+        MolToSmiles,
+        RemoveStereochemistry,
+    )
     from rdkit.Chem.Scaffolds import MurckoScaffold
 
     indexed_scaffolds = []
@@ -190,6 +194,7 @@ def _compute_indexed_scaffolds(smiles_list):
         if mol is None:
             continue
         scaffold_mol = MurckoScaffold.GetScaffoldForMol(mol)
+        RemoveStereochemistry(scaffold_mol)
         scaffold = MolToSmiles(
             scaffold_mol,
             canonical=True,

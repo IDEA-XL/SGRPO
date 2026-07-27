@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 from genmol.diversity import (
     DEFAULT_DIVERSITY_METRIC,
@@ -53,6 +54,35 @@ class MolecularDiversityTest(unittest.TestCase):
             ['c1ccccc1', 'c1ccccc1'],
             metric=RELATIVE_SCAFFOLD_DIVERSITY,
         )
+
+        self.assertAlmostEqual(diversity, 0.5)
+
+    def test_relative_scaffold_diversity_removes_stereochemistry(self):
+        from rdkit import Chem
+
+        original_mol_to_smiles = Chem.MolToSmiles
+
+        def assert_stereo_removed(molecule, **kwargs):
+            self.assertTrue(
+                all(
+                    bond.GetStereo() == Chem.BondStereo.STEREONONE
+                    for bond in molecule.GetBonds()
+                )
+            )
+            return original_mol_to_smiles(molecule, **kwargs)
+
+        with mock.patch.object(
+            Chem,
+            'MolToSmiles',
+            side_effect=assert_stereo_removed,
+        ):
+            diversity = compute_molecular_diversity(
+                [
+                    'c1ccccc1/C=C/c2ccccc2',
+                    'c1ccccc1/C=C\\c2ccccc2',
+                ],
+                metric=RELATIVE_SCAFFOLD_DIVERSITY,
+            )
 
         self.assertAlmostEqual(diversity, 0.5)
 

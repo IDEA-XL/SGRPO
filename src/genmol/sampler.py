@@ -152,7 +152,17 @@ class Sampler:
                                                       *fragment.split('.'), num_samples), fragment)
         return samples
         
-    def fragment_completion(self, fragment, num_samples=1, apply_filter=True, softmax_temp=1.2, randomness=2, gamma=0, **kwargs):
+    def fragment_completion(
+        self,
+        fragment,
+        num_samples=1,
+        apply_filter=True,
+        softmax_temp=1.2,
+        randomness=2,
+        gamma=0,
+        min_add_len=18,
+        **kwargs,
+    ):
         if '*' not in fragment:     # superstructure generation
             cores = sf.utils.list_individual_attach_points(Chem.MolFromSmiles(fragment), depth=3)
             fragment = random.choice(cores)
@@ -162,7 +172,7 @@ class Sampler:
                                  return_tensors='pt',
                                  truncation=True,
                                  max_length=self.model.config.model.max_position_embeddings)['input_ids']
-        x = self._insert_mask(x, num_samples)
+        x = self._insert_mask(x, num_samples, min_add_len=min_add_len)
         samples = self.generate(x, softmax_temp, randomness, gamma=gamma)
 
         if apply_filter:

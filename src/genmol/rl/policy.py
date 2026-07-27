@@ -4,6 +4,7 @@ import random
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 
+import safe as sf
 import torch
 from torch.nn.parallel import DistributedDataParallel
 
@@ -23,6 +24,8 @@ class RolloutBatch:
     specs: list
     safe_strings: list[str]
     smiles: list[str | None]
+    conditions: list[str] | None = None
+    raw_smiles: list[str | None] | None = None
 
 
 def _move_to_cpu(value):
@@ -55,6 +58,7 @@ class GenMolCpGRPOPolicy:
         self.eos_index = self.model.eos_index
         self.pad_index = self.model.tokenizer.pad_token_id
         self.use_bracket_safe = bool(self.model.config.training.get('use_bracket_safe'))
+        self._motif_token_cache = {}
 
         if not trainable:
             self.freeze()
@@ -191,6 +195,200 @@ class GenMolCpGRPOPolicy:
                 smiles = sorted(smiles.split('.'), key=len)[-1]
             smiles_list.append(smiles)
         return smiles_list
+
+    def encode_motif_fragment(self, fragment):
+        cached = self._motif_token_cache.get(fragment)
+        if cached is not None:
+            return cached.clone()
+        if self.use_bracket_safe:
+            raise ValueError(
+                'motif-extension rollout requires the standard SAFE tokenizer, '
+                'not bracket-SAFE'
+            )
+        encoded_fragment = (
+            sf.SAFEConverter(ignore_stereo=True).encoder(
+                fragment,
+                allow_empty=True,
+            )
+            + '.'
+        )
+        token_ids = self.model.tokenizer(
+            [encoded_fragment],
+            return_tensors='pt',
+            truncation=False,
+        )['input_ids'][0].detach().cpu()
+        max_positions = int(self.model.config.model.max_position_embeddings)
+        if token_ids.numel() > max_positions:
+            raise ValueError(
+                'motif prompt exceeds model maximum context: '
+                f'{token_ids.numel()} vs {max_positions} for {fragment!r}'
+            )
+        if token_ids.numel() < 2:
+            raise ValueError(
+                f'motif prompt must contain BOS and EOS: {fragment!r}'
+            )
+        if int(token_ids[0]) != self.bos_index or int(token_ids[-1]) != self.eos_index:
+            raise ValueError(
+                'motif tokenizer output must start with BOS and end with EOS: '
+                f'{fragment!r}'
+            )
+        self._motif_token_cache[fragment] = token_ids
+        return token_ids.clone()
+
+    def motif_base_sequence_length(self, fragment):
+        return int(self.encode_motif_fragment(fragment).numel())
+
+    def rollout_motif_extension(
+        self,
+        specs,
+        fragments,
+        generation_batch_size,
+        seed,
+        gamma=0.3,
+        guidance_weight=2.0,
+    ):
+        if not specs:
+            raise ValueError('specs must be non-empty')
+        if len(fragments) != len(specs):
+            raise ValueError(
+                f'fragments must match specs length: {len(fragments)} vs {len(specs)}'
+            )
+        if generation_batch_size <= 0:
+            raise ValueError('generation_batch_size must be positive')
+        gamma = float(gamma)
+        guidance_weight = float(guidance_weight)
+        if not 0.0 <= gamma <= 1.0:
+            raise ValueError(f'gamma must be in [0, 1], got {gamma}')
+        if guidance_weight <= 0.0:
+            raise ValueError(
+                f'guidance_weight must be positive, got {guidance_weight}'
+            )
+
+        torch.manual_seed(seed)
+        if self.device.type == 'cuda':
+            torch.cuda.manual_seed_all(seed)
+        random.seed(seed)
+
+        base_rows = [self.encode_motif_fragment(fragment) for fragment in fragments]
+        row_lengths = [
+            int(base.numel()) + int(spec.add_seq_len)
+            for base, spec in zip(base_rows, specs)
+        ]
+        max_positions = int(self.model.config.model.max_position_embeddings)
+        overlength = [
+            (idx, length)
+            for idx, length in enumerate(row_lengths)
+            if length > max_positions
+        ]
+        if overlength:
+            idx, length = overlength[0]
+            raise ValueError(
+                'motif-extension prompt plus generated region exceeds model context: '
+                f'{length} vs {max_positions} at sample {idx}'
+            )
+        global_max_length = max(row_lengths)
+        chunk_outputs = []
+        chunk_masks = []
+
+        with self.backbone_eval_mode():
+            with torch.no_grad():
+                start = 0
+                while start < len(specs):
+                    max_end = min(start + generation_batch_size, len(specs))
+                    ref_spec = specs[start]
+                    end = start + 1
+                    while end < max_end:
+                        candidate = specs[end]
+                        if (
+                            candidate.generation_temperature
+                            != ref_spec.generation_temperature
+                            or candidate.randomness != ref_spec.randomness
+                        ):
+                            break
+                        end += 1
+                    chunk_specs = specs[start:end]
+                    chunk_bases = base_rows[start:end]
+                    token_ids = torch.full(
+                        (len(chunk_specs), global_max_length),
+                        fill_value=self.pad_index,
+                        device=self.device,
+                        dtype=torch.long,
+                    )
+                    completion_mask = torch.zeros_like(
+                        token_ids,
+                        dtype=torch.bool,
+                    )
+                    context_mask = torch.zeros_like(
+                        token_ids,
+                        dtype=torch.bool,
+                    )
+                    for row_idx, (base, spec) in enumerate(
+                        zip(chunk_bases, chunk_specs)
+                    ):
+                        base = base.to(self.device)
+                        base_length = int(base.numel())
+                        add_length = int(spec.add_seq_len)
+                        token_ids[row_idx, :base_length - 1] = base[:-1]
+                        mask_start = base_length - 1
+                        mask_end = mask_start + add_length
+                        token_ids[row_idx, mask_start:mask_end] = self.mask_index
+                        token_ids[row_idx, mask_end] = base[-1]
+                        completion_mask[row_idx, mask_start:mask_end] = True
+                        context_mask[row_idx, 1:base_length - 1] = True
+
+                    x = token_ids
+                    num_steps = max(
+                        self.model.mdlm.get_num_steps_confidence(x),
+                        2,
+                    )
+                    for step_idx in range(num_steps):
+                        logits = self.forward_logits(x)
+                        if gamma > 0.0 and guidance_weight != 1.0:
+                            poor_x = x.clone()
+                            for row_idx in range(poor_x.size(0)):
+                                context_positions = torch.nonzero(
+                                    context_mask[row_idx],
+                                    as_tuple=False,
+                                ).view(-1).tolist()
+                                num_mask = int(len(context_positions) * gamma)
+                                if num_mask > 0:
+                                    selected = random.sample(
+                                        context_positions,
+                                        num_mask,
+                                    )
+                                    poor_x[row_idx, selected] = self.mask_index
+                            poor_logits = self.forward_logits(poor_x)
+                            logits = (
+                                guidance_weight * logits
+                                + (1.0 - guidance_weight) * poor_logits
+                            )
+                        x = self.model.mdlm.step_confidence(
+                            logits,
+                            x,
+                            step_idx,
+                            num_steps,
+                            chunk_specs[0].generation_temperature,
+                            chunk_specs[0].randomness,
+                        )
+                    chunk_outputs.append(x.detach().clone())
+                    chunk_masks.append(completion_mask.detach().clone())
+                    start = end
+
+        token_ids = torch.cat(chunk_outputs, dim=0)
+        completion_mask = torch.cat(chunk_masks, dim=0)
+        safe_strings = self._decode_safe_strings(token_ids)
+        raw_smiles = self._decode_smiles(safe_strings)
+        return RolloutBatch(
+            prompt_ids=token_ids[:, :0].detach().clone(),
+            completion_ids=token_ids.detach().clone(),
+            completion_mask=completion_mask,
+            full_token_ids=token_ids,
+            specs=list(specs),
+            safe_strings=safe_strings,
+            smiles=list(raw_smiles),
+            conditions=list(fragments),
+            raw_smiles=list(raw_smiles),
+        )
 
     def rollout_specs(self, specs, generation_batch_size, seed):
         if not specs:

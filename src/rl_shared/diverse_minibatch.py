@@ -108,13 +108,12 @@ def select_molecule_groups(
         fingerprint_sec += time.perf_counter() - fp_started
         valid_count += len(group_valid_indices)
         if not group_valid_indices:
-            raise RuntimeError(
-                'Diverse Mini-Batch GRPO found no valid molecular candidate in '
-                f'group {group_idx}; refusing to fabricate an optimization sample'
-            )
-
-        if len(group_valid_indices) <= selected_size:
+            original_group_picks = []
+        elif len(group_valid_indices) <= selected_size:
             group_picks = list(range(len(group_valid_indices)))
+            original_group_picks = sorted(
+                group_valid_indices[idx] for idx in group_picks
+            )
         else:
             group_picks, timings = _sample_exact_tanimoto_k_dpp(
                 fingerprints,
@@ -126,11 +125,14 @@ def select_molecule_groups(
             raw_kernel_ranks.append(timings['raw_kernel_rank'])
             regularized_group_count += timings['regularized']
             dpp_group_count += 1
+            original_group_picks = sorted(
+                group_valid_indices[idx] for idx in group_picks
+            )
 
-        original_group_picks = sorted(group_valid_indices[idx] for idx in group_picks)
         padded_picks, group_mask = _pad_group_selection(
             original_group_picks,
             selected_size=selected_size,
+            empty_fallback_index=0,
         )
         group_offset = group_idx * candidate_size
         selected_indices.extend(group_offset + idx for idx in padded_picks)

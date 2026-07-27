@@ -35,6 +35,64 @@ def sample_add_seq_len(min_add_len, rng, max_completion_length=None, length_path
     return add_seq_len
 
 
+def sample_conditioned_add_seq_len(
+    base_sequence_length,
+    min_add_len,
+    rng,
+    max_completion_length=None,
+    length_path=None,
+):
+    if base_sequence_length < 2:
+        raise ValueError('base_sequence_length must include at least BOS and EOS')
+    seq_len_list = load_length_distribution(length_path)
+    sampled_total_length = rng.choice(seq_len_list)
+    add_seq_len = max(sampled_total_length - base_sequence_length, min_add_len)
+    if max_completion_length is not None:
+        add_seq_len = min(add_seq_len, max_completion_length)
+    return add_seq_len
+
+
+def sample_conditioned_group_specs(
+    base_sequence_lengths,
+    generation_temperature,
+    randomness,
+    min_add_len,
+    seed,
+    max_completion_length=None,
+    length_path=None,
+):
+    if not base_sequence_lengths:
+        raise ValueError('base_sequence_lengths must be non-empty')
+    rng = random.Random(seed)
+    specs = []
+    for base_sequence_length in base_sequence_lengths:
+        specs.append(
+            DeNovoSpec(
+                add_seq_len=sample_conditioned_add_seq_len(
+                    base_sequence_length=base_sequence_length,
+                    min_add_len=min_add_len,
+                    rng=rng,
+                    max_completion_length=max_completion_length,
+                    length_path=length_path,
+                ),
+                generation_temperature=sample_scalar_or_range(
+                    generation_temperature,
+                    rng,
+                    name='generation_temperature',
+                    min_exclusive=0.0,
+                ),
+                randomness=sample_scalar_or_range(
+                    randomness,
+                    rng,
+                    name='randomness',
+                    min_exclusive=0.0,
+                ),
+                min_add_len=min_add_len,
+            )
+        )
+    return specs
+
+
 def sample_group_specs(
     num_groups,
     generation_temperature,

@@ -14,7 +14,7 @@ motif_extension:
   softmax_temp: 1.2
   randomness: 1.0
   gamma: 0.3
-  min_add_len: 24
+  min_add_len: 18
 scaffold_decoration:
   softmax_temp: 1.5
   randomness: 2

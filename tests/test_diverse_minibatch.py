@@ -50,6 +50,18 @@ class DiverseMiniBatchTest(unittest.TestCase):
         self.assertEqual(sorted(active_smiles), ['CCN', 'CCO'])
         self.assertEqual(selection.metrics['shortfall_count'], 1.0)
 
+    def test_molecule_all_invalid_group_is_fully_inactive(self):
+        selection = select_molecule_groups(
+            [None, "not-a-smiles", "", None],
+            candidate_size=4,
+            selected_size=3,
+            seed=7,
+        )
+        self.assertEqual(selection.indices, (0, 0, 0))
+        self.assertEqual(selection.active_mask, (False, False, False))
+        self.assertEqual(selection.metrics["selected_count"], 0.0)
+        self.assertEqual(selection.metrics["shortfall_count"], 3.0)
+
     def test_exact_tanimoto_k_dpp_returns_unique_valid_subset(self):
         smiles = [
             'CCO',

@@ -34,6 +34,13 @@ from genmol.rl.cpgrpo import (
     validate_reward_threshold_names,
 )
 from genmol.rl.policy import GenMolCpGRPOPolicy
+from genmol.rl.motif import (
+    attachment_free_query,
+    expand_group_motif_records,
+    load_motif_records,
+    molecule_contains_query,
+    sample_group_motif_records,
+)
 from genmol.rl.reward import (
     MOLECULAR_REWARD_NAME_ORDER,
     MolecularReward,
@@ -43,6 +50,7 @@ from genmol.rl.reward import (
 from genmol.rl.specs import (
     deserialize_specs,
     expand_group_specs,
+    sample_conditioned_group_specs,
     sample_group_specs,
     sample_supergroup_shared_specs,
     serialize_specs,
@@ -136,6 +144,10 @@ class TrainConfig:
     diverse_minibatch_oversample_factor: int = 2
     entropy_regularization_weight: float = 0.0
     profile_step_timing: bool = False
+    generation_task: str = 'de_novo'
+    motif_extension_dataset_path: str | None = None
+    motif_extension_gamma: float = 0.3
+    motif_extension_guidance_weight: float = 2.0
 
 
 @dataclass
@@ -195,6 +207,34 @@ def load_config(path):
     )
     if config.entropy_regularization_weight < 0.0:
         raise ValueError('entropy_regularization_weight must be non-negative')
+    if config.generation_task not in {'de_novo', 'motif_extension'}:
+        raise ValueError(
+            "generation_task must be 'de_novo' or 'motif_extension', "
+            f"got {config.generation_task!r}"
+        )
+    config.motif_extension_gamma = float(config.motif_extension_gamma)
+    config.motif_extension_guidance_weight = float(
+        config.motif_extension_guidance_weight
+    )
+    if not 0.0 <= config.motif_extension_gamma <= 1.0:
+        raise ValueError('motif_extension_gamma must be in [0, 1]')
+    if config.motif_extension_guidance_weight <= 0.0:
+        raise ValueError('motif_extension_guidance_weight must be positive')
+    if config.generation_task == 'motif_extension':
+        if not config.motif_extension_dataset_path:
+            raise ValueError(
+                'motif_extension_dataset_path is required for motif_extension'
+            )
+        ensure_exists(
+            config.motif_extension_dataset_path,
+            'motif-extension training dataset',
+        )
+        if config.hbd:
+            raise ValueError('hbd is not supported for motif_extension')
+    elif config.motif_extension_dataset_path is not None:
+        raise ValueError(
+            'motif_extension_dataset_path is only valid for motif_extension'
+        )
     config.rollout_reward_weights = normalize_molecular_reward_weights(
         {
             'qed': config.qed,
@@ -285,10 +325,20 @@ def resolve_output_dir(config, config_path):
 
     cluster_root = '/public/home/xinwuye/ai4s-tool-joint-train'
     if os.path.isdir(cluster_root):
-        base_dir = os.path.join(cluster_root, 'runs', 'cpgrpo_denovo')
+        run_name = (
+            'cpgrpo_motif_extension'
+            if config.generation_task == 'motif_extension'
+            else 'cpgrpo_denovo'
+        )
+        base_dir = os.path.join(cluster_root, 'runs', run_name)
     else:
         repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
-        base_dir = os.path.join(repo_root, 'runs', 'cpgrpo_denovo')
+        run_name = (
+            'cpgrpo_motif_extension'
+            if config.generation_task == 'motif_extension'
+            else 'cpgrpo_denovo'
+        )
+        base_dir = os.path.join(repo_root, 'runs', run_name)
 
     config_name = os.path.splitext(os.path.basename(config_path))[0]
     slurm_job_id = os.environ.get('SLURM_JOB_ID')
@@ -531,6 +581,16 @@ class GenMolCpGRPOTrainer:
         if config.gradient_checkpointing:
             self.policy.enable_gradient_checkpointing(config.gradient_checkpointing_kwargs)
         self.policy.train()
+        self.motif_records = ()
+        self._motif_queries = {}
+        if config.generation_task == 'motif_extension':
+            self.motif_records = load_motif_records(
+                config.motif_extension_dataset_path
+            )
+            self._motif_queries = {
+                record.smiles: attachment_free_query(record.smiles)
+                for record in self.motif_records
+            }
 
         optimizer = torch.optim.AdamW(
             self.policy.trainable_parameters(),
@@ -750,7 +810,9 @@ class GenMolCpGRPOTrainer:
             if name in metadata:
                 bucket[name].append(float(metadata[name]))
         for name, value in metadata.items():
-            if name.startswith('diverse_minibatch/'):
+            if name.startswith(
+                ('diverse_minibatch/', 'motif_extension/')
+            ):
                 bucket[name].append(float(value))
 
     def _record_loss_metrics(self, mode, step_metrics):
@@ -919,6 +981,16 @@ class GenMolCpGRPOTrainer:
             specs=[rollout.specs[idx] for idx in selection.indices],
             safe_strings=[rollout.safe_strings[idx] for idx in selection.indices],
             smiles=[rollout.smiles[idx] for idx in selection.indices],
+            conditions=(
+                None
+                if rollout.conditions is None
+                else [rollout.conditions[idx] for idx in selection.indices]
+            ),
+            raw_smiles=(
+                None
+                if rollout.raw_smiles is None
+                else [rollout.raw_smiles[idx] for idx in selection.indices]
+            ),
         )
         selected_specs = [local_specs[idx] for idx in selection.indices]
         metrics = {
@@ -935,10 +1007,12 @@ class GenMolCpGRPOTrainer:
             active_mask,
             as_tuple=False,
         ).view(-1).tolist()
-        if not active_positions:
-            raise RuntimeError('selected rollout contains no active samples')
-        active_records = self.reward_model.score(
-            [rollout.smiles[idx] for idx in active_positions]
+        active_records = (
+            self.reward_model.score(
+                [rollout.smiles[idx] for idx in active_positions]
+            )
+            if active_positions
+            else []
         )
         if len(active_records) != len(active_positions):
             raise RuntimeError(
@@ -966,8 +1040,40 @@ class GenMolCpGRPOTrainer:
         preparation_started_at = self._start_profile_timer()
         profile_timings = {}
         cycle_seed = self.config.seed + self.generation_cycle_idx * 10000
+        expanded_motif_records = None
         if self.accelerator.is_main_process:
-            if self.config.rl_algorithm == 'coupled_sgrpo':
+            if self.config.generation_task == 'motif_extension':
+                shared_group_count = (
+                    self.config.supergroup_num_groups
+                    if self.config.rl_algorithm == 'coupled_sgrpo'
+                    else 1
+                )
+                group_motif_records = sample_group_motif_records(
+                    self.motif_records,
+                    num_groups=self.num_groups_global,
+                    supergroup_num_groups=shared_group_count,
+                    seed=cycle_seed + 777,
+                )
+                base_sequence_lengths = [
+                    self.policy.motif_base_sequence_length(record.smiles)
+                    for record in group_motif_records
+                ]
+                group_specs = sample_conditioned_group_specs(
+                    base_sequence_lengths=base_sequence_lengths,
+                    generation_temperature=self.config.generation_temperature,
+                    randomness=self.config.randomness,
+                    min_add_len=self.config.min_add_len,
+                    max_completion_length=self.config.max_completion_length,
+                    seed=cycle_seed,
+                )
+                expanded_motif_records = [
+                    record.__dict__
+                    for record in expand_group_motif_records(
+                        group_motif_records,
+                        self.candidate_group_size,
+                    )
+                ]
+            elif self.config.rl_algorithm == 'coupled_sgrpo':
                 group_specs = sample_supergroup_shared_specs(
                     num_groups=self.num_groups_global,
                     supergroup_num_groups=self.config.supergroup_num_groups,
@@ -994,6 +1100,16 @@ class GenMolCpGRPOTrainer:
             self.candidate_group_size,
             self.accelerator,
         )
+        if self.config.generation_task == 'motif_extension':
+            expanded_motif_records = broadcast_object(
+                expanded_motif_records,
+                self.accelerator,
+            )
+            if len(expanded_motif_records) != self.global_candidate_count:
+                raise ValueError(
+                    f'Expected {self.global_candidate_count} expanded motifs, '
+                    f'got {len(expanded_motif_records)}'
+                )
         if len(expanded_specs) != self.global_candidate_count:
             raise ValueError(
                 f'Expected {self.global_candidate_count} candidate specs, '
@@ -1004,13 +1120,77 @@ class GenMolCpGRPOTrainer:
         )
         candidate_local_end = candidate_local_start + self.local_candidate_count
         local_specs = expanded_specs[candidate_local_start:candidate_local_end]
+        local_motif_records = (
+            None
+            if expanded_motif_records is None
+            else expanded_motif_records[
+                candidate_local_start:candidate_local_end
+            ]
+        )
         rollout_seed = cycle_seed + self.accelerator.process_index * 1000
         with self._profile_phase(profile_timings, 'generation_sec'):
-            rollout = self.policy.rollout_specs(
-                specs=local_specs,
-                generation_batch_size=self.config.generation_batch_size,
-                seed=rollout_seed,
+            if self.config.generation_task == 'motif_extension':
+                local_fragments = [
+                    record['smiles'] for record in local_motif_records
+                ]
+                rollout = self.policy.rollout_motif_extension(
+                    specs=local_specs,
+                    fragments=local_fragments,
+                    generation_batch_size=self.config.generation_batch_size,
+                    seed=rollout_seed,
+                    gamma=self.config.motif_extension_gamma,
+                    guidance_weight=(
+                        self.config.motif_extension_guidance_weight
+                    ),
+                )
+            else:
+                rollout = self.policy.rollout_specs(
+                    specs=local_specs,
+                    generation_batch_size=self.config.generation_batch_size,
+                    seed=rollout_seed,
+                )
+        motif_metrics = {}
+        if self.config.generation_task == 'motif_extension':
+            raw_smiles = list(rollout.smiles)
+            retained = [
+                molecule_contains_query(
+                    smiles,
+                    self._motif_queries[fragment],
+                )
+                for smiles, fragment in zip(raw_smiles, rollout.conditions)
+            ]
+            rollout = replace(
+                rollout,
+                raw_smiles=raw_smiles,
+                smiles=[
+                    smiles if keep else None
+                    for smiles, keep in zip(raw_smiles, retained)
+                ],
             )
+            local_candidate_valid = torch.tensor(
+                [smiles is not None for smiles in raw_smiles],
+                device=self.device,
+                dtype=torch.float32,
+            )
+            local_candidate_retained = torch.tensor(
+                retained,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            gathered_candidate_valid = self.accelerator.gather(
+                local_candidate_valid
+            )
+            gathered_candidate_retained = self.accelerator.gather(
+                local_candidate_retained
+            )
+            motif_metrics = {
+                'motif_extension/candidate_valid_fraction': float(
+                    gathered_candidate_valid.mean().item()
+                ),
+                'motif_extension/candidate_retention_fraction': float(
+                    gathered_candidate_retained.mean().item()
+                ),
+            }
         rollout, local_specs, local_active_mask, selection_metrics = (
             self._select_diverse_rollout(
                 rollout,
@@ -1027,6 +1207,10 @@ class GenMolCpGRPOTrainer:
         local_rewards = torch.tensor([record.reward for record in reward_records], device=self.device, dtype=torch.float32)
         global_rewards = self.accelerator.gather(local_rewards).detach()
         global_active_mask = self.accelerator.gather(local_active_mask).detach()
+        if not bool(global_active_mask.any()):
+            raise RuntimeError(
+                'motif/DMB rollout contains no active samples globally'
+            )
         local_start = self.accelerator.process_index * self.local_sample_count
         local_end = local_start + self.local_sample_count
         hbd_metrics = {}
@@ -1172,6 +1356,7 @@ class GenMolCpGRPOTrainer:
             )
         extra_advantage_metrics.update({f'hbd/{key}': float(value) for key, value in hbd_metrics.items()})
         extra_advantage_metrics.update(selection_metrics)
+        extra_advantage_metrics.update(motif_metrics)
         local_final_rewards = global_rewards[local_start:local_end].to(device=self.device)
 
         local_valid = torch.tensor([float(record.is_valid) for record in reward_records], device=self.device)
@@ -1233,8 +1418,28 @@ class GenMolCpGRPOTrainer:
                 )
 
         log_rows = []
-        for spec, safe_string, record, final_reward, is_active in zip(
+        raw_smiles_for_logs = (
+            rollout.raw_smiles
+            if rollout.raw_smiles is not None
+            else rollout.smiles
+        )
+        conditions_for_logs = (
+            rollout.conditions
+            if rollout.conditions is not None
+            else [None] * len(rollout.smiles)
+        )
+        for (
+            spec,
+            condition,
+            raw_smiles,
+            safe_string,
+            record,
+            final_reward,
+            is_active,
+        ) in zip(
             local_specs,
+            conditions_for_logs,
+            raw_smiles_for_logs,
             rollout.safe_strings,
             reward_records,
             local_final_rewards.tolist(),
@@ -1248,8 +1453,15 @@ class GenMolCpGRPOTrainer:
                     'buffer_cycle': self.generation_cycle_idx,
                     'step': self.global_step,
                     'spec': spec.__dict__,
+                    'condition': condition,
                     'safe': safe_string,
+                    'raw_smiles': raw_smiles,
                     'smiles': record.smiles,
+                    'motif_retained': (
+                        None
+                        if condition is None
+                        else record.smiles is not None
+                    ),
                     'reward': float(final_reward),
                     'qed': record.qed,
                     'sa': record.sa,

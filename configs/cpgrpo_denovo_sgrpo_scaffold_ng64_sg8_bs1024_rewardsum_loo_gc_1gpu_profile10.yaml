@@ -13,7 +13,7 @@ bf16: true
 do_eval: false
 num_generations: 64
 num_iterations: 1
-per_device_train_batch_size: 4096
+per_device_train_batch_size: 1024
 gradient_accumulation_steps: 1
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
@@ -27,7 +27,7 @@ max_grad_norm: 0.2
 logging_first_step: true
 logging_steps: 1
 logging_strategy: steps
-max_steps: 4
+max_steps: 10
 lr_scheduler_type: cosine_with_min_lr
 lr_scheduler_kwargs:
   min_lr_rate: 0.1
@@ -36,7 +36,7 @@ save_strategy: steps
 save_steps: 100
 save_total_limit: 1
 random_masking: true
-generation_batch_size: 4096
+generation_batch_size: 1024
 generation_temperature: 1.0
 randomness: 0.3
 min_add_len: 60

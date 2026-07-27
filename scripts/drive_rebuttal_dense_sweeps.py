@@ -813,7 +813,7 @@ def _submit_group(
     command = [
         str(SBATCH),
         "--parsable",
-        "--exclude=server13",
+        "--exclude=server13,server59",
         f"--job-name={group.job_name}",
         f"--output={group.output_pattern}",
         f"--error={group.error_pattern}",

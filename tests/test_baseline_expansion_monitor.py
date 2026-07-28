@@ -32,6 +32,8 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             current_state='RUNNING',
             previous_step=450,
             current_step=450,
+            previous_completed_row_count=46,
+            current_completed_row_count=46,
             previous_epoch=100.0,
             now=1000.0,
         )
@@ -44,11 +46,45 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             current_state='RUNNING',
             previous_step=450,
             current_step=450,
+            previous_completed_row_count=46,
+            current_completed_row_count=46,
             previous_epoch=100.0,
             now=1000.0,
         )
 
         self.assertEqual(updated, 100.0)
+
+    def test_duplicate_resume_step_row_resets_stale_progress_window(self):
+        updated = monitor._updated_progress_epoch(
+            previous_state='RUNNING',
+            current_state='RUNNING',
+            previous_step=460,
+            current_step=460,
+            previous_completed_row_count=47,
+            current_completed_row_count=48,
+            previous_epoch=100.0,
+            now=1000.0,
+        )
+
+        self.assertEqual(updated, 1000.0)
+
+    def test_resumed_progress_resolves_stale_alert(self):
+        message = (
+            'mmgenmol_dmb has not advanced beyond step 460 within the '
+            'stale-progress threshold'
+        )
+        runtime = {'alerts': [message, 'unrelated alert']}
+        with tempfile.TemporaryDirectory() as directory:
+            events_path = Path(directory) / 'events.log'
+            monitor._resolve_alerts_with_prefix(
+                runtime,
+                events_path,
+                'mmgenmol_dmb has not advanced beyond step ',
+            )
+            events = events_path.read_text()
+
+        self.assertEqual(runtime['alerts'], ['unrelated alert'])
+        self.assertIn(f'RESOLVED {message}', events)
 
     def test_molecular_metrics_do_not_require_loss(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -68,6 +104,7 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             result = monitor._read_metrics(self._entropy_spec(metrics_path))
 
         self.assertEqual(result['max_step'], 10)
+        self.assertEqual(result['completed_row_count'], 2)
         self.assertTrue(result['first_ten_verified'])
 
     def test_nonfinite_grad_norm_is_rejected(self):
@@ -105,6 +142,7 @@ class BaselineExpansionMonitorTest(unittest.TestCase):
             )
 
         self.assertEqual(result['max_step'], 1)
+        self.assertEqual(result['completed_row_count'], 1)
 
     def test_terminal_job_rejects_incomplete_final_record(self):
         with tempfile.TemporaryDirectory() as directory:

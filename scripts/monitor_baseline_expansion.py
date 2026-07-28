@@ -281,11 +281,13 @@ def _read_metrics(
         return {
             "path": None,
             "max_step": 0,
+            "completed_row_count": 0,
             "first_ten_verified": False,
             "latest": {},
         }
 
     rows_by_step: dict[int, dict] = {}
+    completed_row_count = 0
     lines = path.read_text(errors="replace").splitlines(keepends=True)
     nonempty_line_numbers = [
         line_number
@@ -312,6 +314,7 @@ def _read_metrics(
         step = int(row.get("step", 0))
         if step <= 0:
             raise RuntimeError(f"Invalid step in {path}:{line_number}: {step}")
+        completed_row_count += 1
         rows_by_step[step] = row
 
     for step, row in rows_by_step.items():
@@ -460,6 +463,7 @@ def _read_metrics(
     return {
         "path": str(path),
         "max_step": max_step,
+        "completed_row_count": completed_row_count,
         "first_ten_verified": 1 in rows_by_step and 10 in rows_by_step,
         "latest": rows_by_step.get(max_step, {}),
     }
@@ -554,6 +558,40 @@ def _record_alert(runtime: dict, events_path: Path, message: str) -> None:
     _append_event(events_path, f"ALERT {message}")
 
 
+def _resolve_alerts_with_prefix(
+    runtime: dict,
+    events_path: Path,
+    prefix: str,
+) -> None:
+    resolved = [
+        message
+        for message in runtime["alerts"]
+        if message.startswith(prefix)
+    ]
+    if not resolved:
+        return
+    runtime["alerts"] = [
+        message
+        for message in runtime["alerts"]
+        if not message.startswith(prefix)
+    ]
+    for message in resolved:
+        _append_event(events_path, f"RESOLVED {message}")
+
+
+def _metrics_progressed(
+    *,
+    previous_step: int,
+    current_step: int,
+    previous_completed_row_count: int,
+    current_completed_row_count: int,
+) -> bool:
+    return (
+        current_step > previous_step
+        or current_completed_row_count > previous_completed_row_count
+    )
+
+
 def _controller_job_id(launcher_record: dict) -> int | None:
     text = _read_tail(launcher_record["stdout"])
     match = CONTROLLER_PATTERN.search(text)
@@ -566,10 +604,17 @@ def _updated_progress_epoch(
     current_state: str,
     previous_step: int,
     current_step: int,
+    previous_completed_row_count: int,
+    current_completed_row_count: int,
     previous_epoch: float,
     now: float,
 ) -> float:
-    if current_step > previous_step:
+    if _metrics_progressed(
+        previous_step=previous_step,
+        current_step=current_step,
+        previous_completed_row_count=previous_completed_row_count,
+        current_completed_row_count=current_completed_row_count,
+    ):
         return now
     if current_state == "RUNNING" and previous_state != "RUNNING":
         return now
@@ -607,8 +652,17 @@ def _poll(
         previous = runtime["jobs"].get(spec.name, {})
         previous_state = previous.get("state")
         previous_step = int(previous.get("max_step", 0))
+        previous_completed_row_count = int(
+            previous.get("completed_row_count", 0)
+        )
         previous_first_ten_verified = bool(
             previous.get("first_ten_verified", False)
+        )
+        metrics_progressed = _metrics_progressed(
+            previous_step=previous_step,
+            current_step=metrics["max_step"],
+            previous_completed_row_count=previous_completed_row_count,
+            current_completed_row_count=metrics["completed_row_count"],
         )
         last_progress_epoch = float(previous.get("last_progress_epoch", now))
         last_progress_epoch = _updated_progress_epoch(
@@ -616,13 +670,23 @@ def _poll(
             current_state=record["state"],
             previous_step=previous_step,
             current_step=metrics["max_step"],
+            previous_completed_row_count=previous_completed_row_count,
+            current_completed_row_count=metrics["completed_row_count"],
             previous_epoch=last_progress_epoch,
             now=now,
         )
-        if metrics["max_step"] > previous_step:
+        if metrics_progressed:
             _append_event(
                 events_path,
-                f"PROGRESS {spec.name} step={metrics['max_step']}",
+                (
+                    f"PROGRESS {spec.name} step={metrics['max_step']} "
+                    f"rows={metrics['completed_row_count']}"
+                ),
+            )
+            _resolve_alerts_with_prefix(
+                runtime,
+                events_path,
+                f"{spec.name} has not advanced beyond step ",
             )
         if record["state"] != previous_state:
             _append_event(
@@ -711,6 +775,7 @@ def _poll(
         runtime["jobs"][spec.name] = {
             "state": record["state"],
             "max_step": metrics["max_step"],
+            "completed_row_count": metrics["completed_row_count"],
             "first_ten_verified": metrics["first_ten_verified"],
             "last_progress_epoch": last_progress_epoch,
         }

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from collections import Counter
 from pathlib import Path
@@ -17,8 +18,15 @@ import matplotlib.pyplot as plt
 
 
 VIS_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = VIS_ROOT.parent
 sys.path.insert(0, str(VIS_ROOT))
+sys.path.insert(0, str(REPO_ROOT / "src"))
 import render_rebuttal_dense_results as dense  # noqa: E402
+from genmol.diversity import (  # noqa: E402
+    MORGAN_INTERNAL_DIVERSITY,
+    compute_molecular_diversity,
+)
+from genmol.rl.motif import load_test_motif_records  # noqa: E402
 
 
 SECTION_BEGIN = "<!-- BEGIN MOTIF EXTENSION RESULTS -->"
@@ -62,11 +70,225 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _finite_mean(values: list[object], *, context: str) -> float:
+    finite = []
+    for value in values:
+        if value is None:
+            continue
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ValueError(f"non-finite value for {context}: {value!r}")
+        finite.append(parsed)
+    if not finite:
+        raise ValueError(f"no finite values for {context}")
+    return sum(finite) / len(finite)
+
+
+def _assert_close(
+    actual: object,
+    expected: float,
+    *,
+    context: str,
+) -> None:
+    parsed = float(actual)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite aggregate for {context}: {actual!r}")
+    if not math.isclose(parsed, expected, rel_tol=1.0e-10, abs_tol=1.0e-12):
+        raise ValueError(
+            f"raw-to-summary mismatch for {context}: "
+            f"summary={parsed:.17g} raw={expected:.17g}"
+        )
+
+
+def _recompute_point_summary(
+    rows_by_motif: dict[int, list[dict]],
+    *,
+    context: str,
+) -> dict[str, object]:
+    if set(rows_by_motif) != set(range(10)):
+        raise ValueError(f"incomplete motif coverage for {context}")
+    ordered_rows = []
+    per_motif_diversity = []
+    per_motif_retention = []
+    for motif_index in range(10):
+        motif_rows = sorted(
+            rows_by_motif[motif_index],
+            key=lambda row: int(row["sample_index"]),
+        )
+        if len(motif_rows) != 100:
+            raise ValueError(
+                f"expected 100 rows for {context}, motif={motif_index}"
+            )
+        ordered_rows.extend(motif_rows)
+        per_motif_diversity.append(
+            compute_molecular_diversity(
+                [row["smiles"] for row in motif_rows],
+                metric=MORGAN_INTERNAL_DIVERSITY,
+            )
+        )
+        per_motif_retention.append(
+            sum(row["motif_retained"] for row in motif_rows) / 100
+        )
+
+    return {
+        "soft_reward_mean": _finite_mean(
+            [row["soft_reward"] for row in ordered_rows],
+            context=f"{context} soft_reward",
+        ),
+        "qed_mean": _finite_mean(
+            [row["qed"] for row in ordered_rows],
+            context=f"{context} qed",
+        ),
+        "sa_mean": _finite_mean(
+            [row["sa"] for row in ordered_rows],
+            context=f"{context} sa",
+        ),
+        "sa_score_mean": _finite_mean(
+            [row["sa_score"] for row in ordered_rows],
+            context=f"{context} sa_score",
+        ),
+        "diversity": sum(per_motif_diversity) / len(per_motif_diversity),
+        "per_motif_diversity": per_motif_diversity,
+        "raw_valid_fraction": (
+            sum(row["raw_smiles"] is not None for row in ordered_rows)
+            / len(ordered_rows)
+        ),
+        "motif_retention_fraction": (
+            sum(row["motif_retained"] for row in ordered_rows)
+            / len(ordered_rows)
+        ),
+        "per_motif_retention_fraction": per_motif_retention,
+        "task_valid_fraction": (
+            sum(row["is_valid"] for row in ordered_rows) / len(ordered_rows)
+        ),
+        "alert_hit_fraction": (
+            sum(row["alert_hit"] for row in ordered_rows) / len(ordered_rows)
+        ),
+    }
+
+
+def _validate_point_summary(
+    summary_row: dict,
+    rows_by_motif: dict[int, list[dict]],
+    *,
+    model: dense.ModelSpec,
+    seed: int,
+    point_index: int,
+    checkpoint_path: str,
+) -> None:
+    context = f"{model.source_id}, seed={seed}, point={point_index}"
+    randomness, temperature = dense.MOLECULE_SWEEP[point_index]
+    expected_exact = {
+        "experiment": model.source_id,
+        "display_name": model.label,
+        "checkpoint_path": checkpoint_path,
+        "seed": seed,
+        "point_index": point_index,
+        "sweep_axis": "randomness_temperature_pair",
+        "sweep_label": f"r={randomness:.1f},t={temperature:g}",
+        "num_motifs": 10,
+        "samples_per_motif": 100,
+        "num_samples": 1_000,
+        "diversity_metric": MORGAN_INTERNAL_DIVERSITY,
+    }
+    for field, expected in expected_exact.items():
+        if summary_row.get(field) != expected:
+            raise ValueError(
+                f"unexpected {field} for {context}: "
+                f"{summary_row.get(field)!r} vs {expected!r}"
+            )
+    _assert_close(
+        summary_row.get("randomness"),
+        randomness,
+        context=f"{context} randomness",
+    )
+    _assert_close(
+        summary_row.get("generation_temperature"),
+        temperature,
+        context=f"{context} generation_temperature",
+    )
+    _assert_close(
+        summary_row.get("sweep_value"),
+        float(point_index + 1),
+        context=f"{context} sweep_value",
+    )
+
+    recomputed = _recompute_point_summary(
+        rows_by_motif,
+        context=context,
+    )
+    scalar_fields = (
+        "soft_reward_mean",
+        "qed_mean",
+        "sa_mean",
+        "sa_score_mean",
+        "diversity",
+        "raw_valid_fraction",
+        "motif_retention_fraction",
+        "task_valid_fraction",
+        "alert_hit_fraction",
+    )
+    for field in scalar_fields:
+        _assert_close(
+            summary_row.get(field),
+            float(recomputed[field]),
+            context=f"{context} {field}",
+        )
+    for field in (
+        "per_motif_diversity",
+        "per_motif_retention_fraction",
+    ):
+        actual = summary_row.get(field)
+        expected = recomputed[field]
+        if not isinstance(actual, list) or len(actual) != len(expected):
+            raise ValueError(
+                f"unexpected {field} shape for {context}: "
+                f"{type(actual).__name__}"
+            )
+        for motif_index, (actual_value, expected_value) in enumerate(
+            zip(actual, expected)
+        ):
+            _assert_close(
+                actual_value,
+                float(expected_value),
+                context=f"{context} {field}[{motif_index}]",
+            )
+
+
 class MotifResultStore(dense.ResultStore):
     def __init__(self, run_root: Path):
         self.results_root = run_root
         self._cache = {}
         self._row_hashes = {}
+        self._test_motifs = load_test_motif_records(
+            REPO_ROOT / "data/fragments.csv"
+        )
+        manifest_path = run_root / "manifest.json"
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"missing motif sweep manifest: {manifest_path}"
+            )
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("task_count") != 25:
+            raise ValueError("motif sweep manifest must contain 25 tasks")
+        if manifest.get("seeds") != list(dense.SEEDS):
+            raise ValueError("motif sweep manifest has unexpected seeds")
+        tasks = manifest.get("tasks")
+        if not isinstance(tasks, list) or len(tasks) != 25:
+            raise ValueError("motif sweep manifest has invalid tasks")
+        self._tasks = {}
+        for task in tasks:
+            key = (task.get("experiment"), int(task.get("seed")))
+            if key in self._tasks:
+                raise ValueError(f"duplicate motif sweep manifest task: {key}")
+            self._tasks[key] = task
+        expected_keys = {
+            (model.source_id, seed)
+            for model in PANEL.models
+            for seed in dense.SEEDS
+        }
+        if set(self._tasks) != expected_keys:
+            raise ValueError("motif sweep manifest task coverage is incomplete")
 
     def rows(self, kind: str, seed: int) -> list[dict]:
         if kind != "denovo":
@@ -75,6 +297,16 @@ class MotifResultStore(dense.ResultStore):
             return self._cache[seed]
         rows = []
         for model in PANEL.models:
+            task = self._tasks[(model.source_id, seed)]
+            if task.get("display_name") != model.label:
+                raise ValueError(
+                    f"manifest display name mismatch for {model.source_id}"
+                )
+            checkpoint_path = task.get("checkpoint_path")
+            if not isinstance(checkpoint_path, str) or not checkpoint_path:
+                raise ValueError(
+                    f"manifest checkpoint path is invalid for {model.source_id}"
+                )
             result_dir = (
                 self.results_root
                 / "results"
@@ -102,6 +334,14 @@ class MotifResultStore(dense.ResultStore):
                 )
             if int(metadata.get("seed")) != seed:
                 raise ValueError(f"seed mismatch in {summary_path}")
+            if metadata.get("display_name") != model.label:
+                raise ValueError(f"display-name mismatch in {summary_path}")
+            if metadata.get("checkpoint_path") != checkpoint_path:
+                raise ValueError(f"checkpoint mismatch in {summary_path}")
+            if int(metadata.get("checkpoint_size_bytes", 0)) <= 0:
+                raise ValueError(
+                    f"invalid checkpoint size in {summary_path}"
+                )
             if int(metadata.get("row_count")) != 10_000:
                 raise ValueError(f"unexpected row count in {summary_path}")
             if metadata.get("rows_sha256") != _sha256(rows_path):
@@ -115,11 +355,24 @@ class MotifResultStore(dense.ResultStore):
                 raise ValueError(
                     f"unexpected samples-per-motif in {summary_path}"
                 )
+            expected_generation_metadata = {
+                "min_add_len": 18,
+                "gamma": 0.3,
+                "guidance_weight": 2.0,
+                "generation_batch_size": 1_000,
+            }
+            for field, expected in expected_generation_metadata.items():
+                if metadata.get(field) != expected:
+                    raise ValueError(
+                        f"unexpected {field} in {summary_path}: "
+                        f"{metadata.get(field)!r}"
+                    )
             self._row_hashes[(model.source_id, seed)] = metadata[
                 "rows_sha256"
             ]
             counts = Counter()
             sample_indices = {}
+            raw_rows_by_point_motif = {}
             line_count = 0
             with rows_path.open() as handle:
                 for line_number, line in enumerate(handle, start=1):
@@ -131,6 +384,16 @@ class MotifResultStore(dense.ResultStore):
                     if int(row.get("seed")) != seed:
                         raise ValueError(
                             f"seed mismatch at {rows_path}:{line_number}"
+                        )
+                    if row.get("display_name") != model.label:
+                        raise ValueError(
+                            f"display-name mismatch at "
+                            f"{rows_path}:{line_number}"
+                        )
+                    if row.get("checkpoint_path") != checkpoint_path:
+                        raise ValueError(
+                            f"checkpoint mismatch at "
+                            f"{rows_path}:{line_number}"
                         )
                     key = (
                         int(row["point_index"]),
@@ -159,8 +422,50 @@ class MotifResultStore(dense.ResultStore):
                             f"out-of-range sample index at "
                             f"{rows_path}:{line_number}"
                         )
+                    expected_motif = self._test_motifs[motif_index]
+                    if (
+                        row.get("motif_id") != expected_motif.motif_id
+                        or row.get("motif_smiles") != expected_motif.smiles
+                    ):
+                        raise ValueError(
+                            f"official motif mismatch at "
+                            f"{rows_path}:{line_number}"
+                        )
+                    for field in (
+                        "motif_retained",
+                        "is_valid",
+                        "alert_hit",
+                    ):
+                        if not isinstance(row.get(field), bool):
+                            raise TypeError(
+                                f"{field} must be boolean at "
+                                f"{rows_path}:{line_number}"
+                            )
+                    if row["motif_retained"] and row["raw_smiles"] is None:
+                        raise ValueError(
+                            f"retained motif has no raw molecule at "
+                            f"{rows_path}:{line_number}"
+                        )
+                    if row["is_valid"] and row["smiles"] is None:
+                        raise ValueError(
+                            f"task-valid record has no scored molecule at "
+                            f"{rows_path}:{line_number}"
+                        )
+                    if row["is_valid"] and not row["motif_retained"]:
+                        raise ValueError(
+                            f"task-valid molecule did not retain motif at "
+                            f"{rows_path}:{line_number}"
+                        )
+                    for field in ("qed", "sa", "sa_score", "soft_reward"):
+                        value = row.get(field)
+                        if value is not None and not math.isfinite(float(value)):
+                            raise ValueError(
+                                f"non-finite {field} at "
+                                f"{rows_path}:{line_number}"
+                            )
                     counts[key] += 1
                     sample_indices.setdefault(key, set()).add(sample_index)
+                    raw_rows_by_point_motif.setdefault(key, []).append(row)
                     line_count += 1
             expected_keys = {
                 (point_index, motif_index)
@@ -200,6 +505,19 @@ class MotifResultStore(dense.ResultStore):
                     raise ValueError(
                         f"summary point order mismatch in {summary_path}"
                     )
+                _validate_point_summary(
+                    row,
+                    {
+                        motif_index: raw_rows_by_point_motif[
+                            (point_index, motif_index)
+                        ]
+                        for motif_index in range(10)
+                    },
+                    model=model,
+                    seed=seed,
+                    point_index=point_index,
+                    checkpoint_path=checkpoint_path,
+                )
             rows.extend(result_rows)
         self._cache[seed] = rows
         return rows

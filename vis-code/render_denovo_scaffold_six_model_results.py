@@ -16,8 +16,8 @@ import render_rebuttal_dense_results as dense
 SCAFFOLD_DIVERSITY_METRIC = "relative_scaffold_diversity"
 COLOR_DMB = "#6B5B95"
 COLOR_ENTROPY = "#C85A3E"
-SECTION_BEGIN = "<!-- BEGIN DENOVO SCAFFOLD DIVERSITY RESULTS -->"
-SECTION_END = "<!-- END DENOVO SCAFFOLD DIVERSITY RESULTS -->"
+SECTION_BEGIN = "<!-- BEGIN DENOVO SIX-MODEL SCAFFOLD REANALYSIS RESULTS -->"
+SECTION_END = "<!-- END DENOVO SIX-MODEL SCAFFOLD REANALYSIS RESULTS -->"
 
 PANEL = dense.PanelSpec(
     key="denovo",
@@ -150,9 +150,11 @@ def _result_section(
         for randomness, temperature in dense.MOLECULE_SWEEP
     )
     lines = [
-        "## GenMol De Novo: Scaffold Diversity",
+        "## GenMol De Novo: Six-Model Scaffold-Diversity Reanalysis",
         "",
-        "All six models use the exact saved per-sample generations from the primary "
+        "This is an additional evaluation result and is independent of the earlier "
+        "Scaffold-SGRPO training/evaluation experiment. All six models use the exact "
+        "saved per-sample generations from the primary "
         "five-run Morgan-internal-diversity sweep. Utility is reused unchanged; "
         "only diversity is recomputed as relative Bemis-Murcko scaffold diversity. "
         "Each operating point reports the mean and 95% confidence interval over "

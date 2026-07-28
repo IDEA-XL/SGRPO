@@ -24,6 +24,7 @@ class RenderDenovoCreditAblationResultsTest(unittest.TestCase):
         self.assertEqual(
             [model.source_id for model in render.PANEL.models],
             [
+                "genmol_denovo_sgrpo_rewardsum_loo_2000",
                 "denovo_raw_loo_diversity_2000",
                 "denovo_mean_baseline_2000",
                 "denovo_mean_baseline_std_2000",

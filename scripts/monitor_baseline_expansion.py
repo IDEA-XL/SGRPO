@@ -560,6 +560,22 @@ def _controller_job_id(launcher_record: dict) -> int | None:
     return int(match.group(1)) if match is not None else None
 
 
+def _updated_progress_epoch(
+    *,
+    previous_state: str | None,
+    current_state: str,
+    previous_step: int,
+    current_step: int,
+    previous_epoch: float,
+    now: float,
+) -> float:
+    if current_step > previous_step:
+        return now
+    if current_state == "RUNNING" and previous_state != "RUNNING":
+        return now
+    return previous_epoch
+
+
 def _poll(
     *,
     specs: list[JobSpec],
@@ -595,8 +611,15 @@ def _poll(
             previous.get("first_ten_verified", False)
         )
         last_progress_epoch = float(previous.get("last_progress_epoch", now))
+        last_progress_epoch = _updated_progress_epoch(
+            previous_state=previous_state,
+            current_state=record["state"],
+            previous_step=previous_step,
+            current_step=metrics["max_step"],
+            previous_epoch=last_progress_epoch,
+            now=now,
+        )
         if metrics["max_step"] > previous_step:
-            last_progress_epoch = now
             _append_event(
                 events_path,
                 f"PROGRESS {spec.name} step={metrics['max_step']}",

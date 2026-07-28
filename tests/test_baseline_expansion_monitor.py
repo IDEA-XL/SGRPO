@@ -26,6 +26,30 @@ def _write_metrics(path, rows):
 
 
 class BaselineExpansionMonitorTest(unittest.TestCase):
+    def test_running_resume_resets_stale_progress_window(self):
+        updated = monitor._updated_progress_epoch(
+            previous_state='PENDING',
+            current_state='RUNNING',
+            previous_step=450,
+            current_step=450,
+            previous_epoch=100.0,
+            now=1000.0,
+        )
+
+        self.assertEqual(updated, 1000.0)
+
+    def test_unchanged_running_job_keeps_stale_progress_window(self):
+        updated = monitor._updated_progress_epoch(
+            previous_state='RUNNING',
+            current_state='RUNNING',
+            previous_step=450,
+            current_step=450,
+            previous_epoch=100.0,
+            now=1000.0,
+        )
+
+        self.assertEqual(updated, 100.0)
+
     def test_molecular_metrics_do_not_require_loss(self):
         with tempfile.TemporaryDirectory() as directory:
             metrics_path = Path(directory) / 'metrics.jsonl'

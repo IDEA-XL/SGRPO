@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=96G
-#SBATCH -t 08:00:00
+#SBATCH -t 00:30:00
 #SBATCH --exclude=server13,server46,server59
 #SBATCH -J motif_eval
 #SBATCH -o /public/home/xinwuye/ai4s-tool-joint-train/runs/motif_extension/logs/motif_eval_%A_%a.out

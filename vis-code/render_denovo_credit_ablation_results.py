@@ -23,37 +23,53 @@ EXTRA_MODEL_IDS = (
     "denovo_mean_baseline_std_2000",
 )
 
-PANEL = dense.PanelSpec(
-    key="denovo_credit_ablation",
-    title="De Novo Molecule Design",
-    source_kind="denovo",
-    models=(
-        dense.ModelSpec(
-            SGRPO_MODEL_ID,
-            "SGRPO",
-            dense.COLOR_SGRPO,
-            "o",
+SGRPO_MODEL = dense.ModelSpec(
+    SGRPO_MODEL_ID,
+    "SGRPO",
+    dense.COLOR_SGRPO,
+    "o",
+)
+RAW_LOO_MODEL = dense.ModelSpec(
+    "denovo_raw_loo_diversity_2000",
+    "Raw-LOO Diversity",
+    "#2A9D8F",
+    "D",
+)
+MEAN_BASELINE_MODEL = dense.ModelSpec(
+    "denovo_mean_baseline_2000",
+    "Mean Baseline",
+    "#C85A3E",
+    "s",
+)
+MEAN_BASELINE_STD_MODEL = dense.ModelSpec(
+    "denovo_mean_baseline_std_2000",
+    "Mean Baseline + Std",
+    "#6B5B95",
+    "^",
+)
+
+PANELS = (
+    dense.PanelSpec(
+        key="raw_loo_comparison",
+        title="Raw-LOO Diversity Comparison",
+        source_kind="denovo",
+        models=(
+            SGRPO_MODEL,
+            RAW_LOO_MODEL,
         ),
-        dense.ModelSpec(
-            "denovo_raw_loo_diversity_2000",
-            "Raw-LOO Diversity",
-            "#2A9D8F",
-            "D",
-        ),
-        dense.ModelSpec(
-            "denovo_mean_baseline_2000",
-            "Mean Baseline",
-            "#C85A3E",
-            "s",
-        ),
-        dense.ModelSpec(
-            "denovo_mean_baseline_std_2000",
-            "Mean Baseline + Std",
-            "#6B5B95",
-            "^",
+    ),
+    dense.PanelSpec(
+        key="mean_baseline_comparison",
+        title="Mean-Baseline Comparison",
+        source_kind="denovo",
+        models=(
+            SGRPO_MODEL,
+            MEAN_BASELINE_MODEL,
+            MEAN_BASELINE_STD_MODEL,
         ),
     ),
 )
+ALL_MODEL_IDS = {SGRPO_MODEL_ID, *EXTRA_MODEL_IDS}
 
 
 class CreditAblationStore(dense.ResultStore):
@@ -104,18 +120,17 @@ class CreditAblationStore(dense.ResultStore):
                 )
             self._cache[cache_key] = [*sgrpo_rows, *extra_rows]
         rows = self._cache[cache_key]
-        expected = len(PANEL.models) * len(dense.MOLECULE_SWEEP)
+        expected = len(ALL_MODEL_IDS) * len(dense.MOLECULE_SWEEP)
         if len(rows) != expected:
             raise ValueError(
                 f"Seed {seed} has {len(rows)} credit-ablation rows; "
                 f"expected {expected}"
             )
-        expected_models = {model.source_id for model in PANEL.models}
         actual_models = {row.get("experiment") for row in rows}
-        if actual_models != expected_models:
+        if actual_models != ALL_MODEL_IDS:
             raise ValueError(
                 f"Seed {seed} model mismatch: "
-                f"expected={expected_models}, actual={actual_models}"
+                f"expected={ALL_MODEL_IDS}, actual={actual_models}"
             )
         return rows
 
@@ -193,15 +208,19 @@ def _validate_sgrpo_audit(results_root: Path) -> dict:
     return audit
 
 
-def _plot_figure2(store: CreditAblationStore, output_path: Path) -> None:
+def _plot_figure2(
+    store: CreditAblationStore,
+    panel: dense.PanelSpec,
+    output_path: Path,
+) -> None:
     dense.configure_style(20)
     figure, axis = plt.subplots(figsize=(11.8, 7.8))
     figure.patch.set_facecolor("white")
-    dense._draw_main_panel(axis, store, PANEL)
+    dense._draw_main_panel(axis, store, panel)
     figure.supxlabel("Utility", y=0.205)
     figure.supylabel("Diversity", x=0.025)
     figure.legend(
-        handles=dense._main_legend_handles((PANEL,)),
+        handles=dense._main_legend_handles((panel,)),
         loc="lower center",
         bbox_to_anchor=(0.5, 0.005),
         ncol=3,
@@ -219,7 +238,7 @@ def _result_section(
     store: CreditAblationStore,
     metrics: dict[str, dict[str, tuple[float, float]]],
     references: dict[str, list[dense.Point]],
-    figure_link: str,
+    figure_links: dict[str, str],
 ) -> str:
     molecule_points = ", ".join(
         f"({randomness:g}, {temperature:g})"
@@ -229,65 +248,88 @@ def _result_section(
         "## GenMol De Novo: Credit-Baseline Ablation",
         "",
         "This is an additional five-run evaluation and does not replace any existing "
-        "result section. The paper SGRPO sweep is compared with the three new "
-        "credit-baseline checkpoints under the standard GenMol De Novo protocol: "
-        "QED/SA soft Utility, Morgan-fingerprint internal Diversity, and the ten "
-        "paired randomness-temperature sweep points. For every run, the HV reference "
-        "point is jointly determined from all four models shown in this section.",
+        "result section. The paper SGRPO sweep and the three new credit-baseline "
+        "checkpoints use the standard GenMol De Novo protocol: QED/SA soft Utility, "
+        "Morgan-fingerprint internal Diversity, and the ten paired "
+        "randomness-temperature sweep points. Results are divided into two independent "
+        "comparison groups; no four-model joint metric is reported.",
         "",
-        "| Sweep points | Runs | Samples per model and point | "
-        "New samples | Total compared samples |",
-        "|---|---:|---:|---:|---:|",
-        f"| `{molecule_points}` | 5 | 1,000 | 150,000 | 200,000 |",
-        "",
-        "### Table 1: Frontier Metrics",
-        "",
-        "| Metric | " + " | ".join(model.label for model in PANEL.models) + " |",
-        "|---|" + "|".join("---:" for _ in PANEL.models) + "|",
+        "| Sweep points | Runs | Samples per model and point |",
+        "|---|---:|---:|",
+        f"| `{molecule_points}` | 5 | 1,000 |",
     ]
-    for metric, direction in (("HV", "↑"), ("DIP", "↓"), ("R2", "↓")):
-        values = [
-            dense._format_interval(
-                *metrics[PANEL.key][f"{model.label}:{metric}"]
-            )
-            for model in PANEL.models
-        ]
-        lines.append(f"| {metric} {direction} | " + " | ".join(values) + " |")
 
-    lines.extend(
-        [
-            "",
-            "### Per-Run HV Reference Points",
-            "",
-            "| Seed | Utility reference | Diversity reference |",
-            "|---:|---:|---:|",
-        ]
-    )
-    for seed, point in zip(dense.SEEDS, references[PANEL.key]):
-        lines.append(
-            f"| {seed} | {point.utility:.4f} | {point.diversity:.4f} |"
+    for group_index, panel in enumerate(PANELS, start=1):
+        lines.extend(
+            [
+                "",
+                f"### Group {group_index}: {panel.title}",
+                "",
+                "The per-run HV reference point is determined only from the models "
+                "listed in this group.",
+                "",
+                "#### Table 1: Frontier Metrics",
+                "",
+                "| Metric | "
+                + " | ".join(model.label for model in panel.models)
+                + " |",
+                "|---|" + "|".join("---:" for _ in panel.models) + "|",
+            ]
         )
-
-    lines.extend(
-        [
-            "",
-            "### Figure 2: Utility-Diversity Operating Points",
-            "",
-            f"[PDF]({figure_link})",
-            "",
-            "| Model | Sweep point | Utility mean | Utility 95% CI | "
-            "Diversity mean | Diversity 95% CI |",
-            "|---|---|---:|---:|---:|---:|",
-        ]
-    )
-    for model in PANEL.models:
-        for point in dense.aggregate_series(store, PANEL, model):
+        for metric, direction in (("HV", "↑"), ("DIP", "↓"), ("R2", "↓")):
+            values = [
+                dense._format_interval(
+                    *metrics[panel.key][f"{model.label}:{metric}"]
+                )
+                for model in panel.models
+            ]
             lines.append(
-                f"| {model.label} | {point.point_label} | "
-                f"{point.utility_mean:.4f} | {point.utility_ci95:.4f} | "
-                f"{point.diversity_mean:.4f} | {point.diversity_ci95:.4f} |"
+                f"| {metric} {direction} | " + " | ".join(values) + " |"
             )
+
+        lines.extend(
+            [
+                "",
+                "#### Per-Run HV Reference Points",
+                "",
+                "| Seed | Utility reference | Diversity reference |",
+                "|---:|---:|---:|",
+            ]
+        )
+        for seed, point in zip(dense.SEEDS, references[panel.key]):
+            lines.append(
+                f"| {seed} | {point.utility:.4f} | {point.diversity:.4f} |"
+            )
+
+        lines.extend(
+            [
+                "",
+                "#### Figure 2: Utility-Diversity Operating Points",
+                "",
+                f"[PDF]({figure_links[panel.key]})",
+                "",
+                "| Model | Sweep point | Utility mean | Utility 95% CI | "
+                "Diversity mean | Diversity 95% CI |",
+                "|---|---|---:|---:|---:|---:|",
+            ]
+        )
+        for model in panel.models:
+            for point in dense.aggregate_series(store, panel, model):
+                lines.append(
+                    f"| {model.label} | {point.point_label} | "
+                    f"{point.utility_mean:.4f} | {point.utility_ci95:.4f} | "
+                    f"{point.diversity_mean:.4f} | {point.diversity_ci95:.4f} |"
+                )
     return "\n".join(lines) + "\n"
+
+
+def _figure_paths(output_dir: Path) -> dict[str, Path]:
+    return {
+        "raw_loo_comparison": output_dir
+        / "figure2-denovo-raw-loo-comparison.pdf",
+        "mean_baseline_comparison": output_dir
+        / "figure2-denovo-mean-baseline-comparison.pdf",
+    }
 
 
 def _upsert_section(path: Path, section: str) -> None:
@@ -332,24 +374,32 @@ def main() -> None:
     )
     dense.validate_seed_independence(
         store,
-        (PANEL,),
+        PANELS,
         include_denovo_auxiliary=False,
     )
-    metrics, references = dense.table1_metrics(store, (PANEL,))
+    metrics, references = dense.table1_metrics(store, PANELS)
 
-    figure_path = output_dir / "figure2-denovo-credit-ablation.pdf"
+    figure_paths = _figure_paths(output_dir)
     standalone_path = output_dir / "denovo-credit-ablation-results.md"
-    figure_link = os.path.relpath(
-        figure_path,
-        start=args.expanded_results_path.parent,
-    ).replace(os.sep, "/")
-    _plot_figure2(store, figure_path)
-    section = _result_section(store, metrics, references, figure_link)
+    figure_links = {
+        key: os.path.relpath(
+            path,
+            start=args.expanded_results_path.parent,
+        ).replace(os.sep, "/")
+        for key, path in figure_paths.items()
+    }
+    for panel in PANELS:
+        _plot_figure2(store, panel, figure_paths[panel.key])
+    section = _result_section(store, metrics, references, figure_links)
     standalone_path.write_text(
         "# GenMol De Novo Credit-Baseline Ablation\n\n" + section
     )
     _upsert_section(args.expanded_results_path, section)
-    print(figure_path)
+    legacy_figure_path = output_dir / "figure2-denovo-credit-ablation.pdf"
+    if legacy_figure_path.is_file():
+        legacy_figure_path.unlink()
+    for path in figure_paths.values():
+        print(path)
     print(standalone_path)
     print(args.expanded_results_path)
 

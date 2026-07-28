@@ -20,14 +20,22 @@ SPEC.loader.exec_module(render)
 
 
 class RenderDenovoCreditAblationResultsTest(unittest.TestCase):
-    def test_panel_contains_only_requested_models(self):
+    def test_panels_match_the_two_requested_comparison_groups(self):
         self.assertEqual(
-            [model.source_id for model in render.PANEL.models],
             [
-                "genmol_denovo_sgrpo_rewardsum_loo_2000",
-                "denovo_raw_loo_diversity_2000",
-                "denovo_mean_baseline_2000",
-                "denovo_mean_baseline_std_2000",
+                [model.source_id for model in panel.models]
+                for panel in render.PANELS
+            ],
+            [
+                [
+                    "genmol_denovo_sgrpo_rewardsum_loo_2000",
+                    "denovo_raw_loo_diversity_2000",
+                ],
+                [
+                    "genmol_denovo_sgrpo_rewardsum_loo_2000",
+                    "denovo_mean_baseline_2000",
+                    "denovo_mean_baseline_std_2000",
+                ],
             ],
         )
 

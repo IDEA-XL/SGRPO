@@ -487,7 +487,7 @@ def _build_dag() -> tuple[dict[str, GroupSpec], dict[str, TaskSpec], tuple[str, 
                 job_name=f"rbmmg{seed}",
                 output_pattern=LOG_ROOT / f"mm_generate_seed{seed}_%A_%a.out",
                 error_pattern=LOG_ROOT / f"mm_generate_seed{seed}_%A_%a.err",
-                time_limit="01:00:00",
+                time_limit="00:15:00",
                 exports=(("TASKS_PATH", str(tasks_path)), ("SEED", str(seed))),
             ),
         )

@@ -18,13 +18,18 @@ def main() -> None:
     parser.add_argument("--display-name", required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--checkpoint-step", type=int, required=True)
+    parser.add_argument("--allow-pending-checkpoint", action="store_true")
     args = parser.parse_args()
 
     if args.checkpoint_step <= 0:
         raise ValueError("checkpoint_step must be positive")
     if not args.experiment.strip() or not args.display_name.strip():
         raise ValueError("experiment and display_name must be non-empty")
-    if not args.checkpoint.is_file() or args.checkpoint.stat().st_size == 0:
+    checkpoint_ready = (
+        args.checkpoint.is_file()
+        and args.checkpoint.stat().st_size > 0
+    )
+    if not checkpoint_ready and not args.allow_pending_checkpoint:
         raise FileNotFoundError(
             f"checkpoint is missing or empty: {args.checkpoint}"
         )

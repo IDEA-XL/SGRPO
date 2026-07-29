@@ -131,6 +131,11 @@ def _parse_args() -> argparse.Namespace:
         type=_positive_int,
         default=1800,
     )
+    parser.add_argument(
+        "--finalization-grace-seconds",
+        type=_positive_int,
+        default=300,
+    )
     return parser.parse_args()
 
 
@@ -310,6 +315,36 @@ def _validate_checkpoint(run_dir: Path, final_step: int) -> Path:
             f"{train_results_path}"
         )
     return model_path
+
+
+def _completed_training_readiness(
+    run_dir: Path,
+    metrics: dict,
+    final_step: int,
+) -> tuple[bool, str]:
+    try:
+        _validate_checkpoint(run_dir, final_step)
+    except (FileNotFoundError, json.JSONDecodeError) as exc:
+        return False, str(exc)
+    if metrics["max_step"] != final_step:
+        return (
+            False,
+            f"metrics ended at {metrics['max_step']}, expected {final_step}",
+        )
+    return True, ""
+
+
+def _within_finalization_grace(
+    record: dict,
+    *,
+    now: float,
+    grace_seconds: int,
+) -> bool:
+    observed_at = record.setdefault(
+        "completion_observed_at_epoch",
+        now,
+    )
+    return now - float(observed_at) <= grace_seconds
 
 
 def _smoke_run_dir(smoke_job_id: int) -> Path:
@@ -553,7 +588,11 @@ def _checkpoint_ready_for_task(task: dict, state: dict) -> bool:
     return validated == checkpoint
 
 
-def _refresh_sweep_jobs(state: dict, manifest: dict) -> None:
+def _refresh_sweep_jobs(
+    state: dict,
+    manifest: dict,
+    finalization_grace_seconds: int,
+) -> None:
     tasks_by_index = {
         str(task["task_index"]): task
         for task in manifest["tasks"]
@@ -580,9 +619,16 @@ def _refresh_sweep_jobs(state: dict, manifest: dict) -> None:
                 f"{submission['job_id']}: {record}"
             )
         if record["state"] == "COMPLETED":
+            if _within_finalization_grace(
+                submission,
+                now=time.time(),
+                grace_seconds=finalization_grace_seconds,
+            ):
+                continue
             raise RuntimeError(
                 f"Motif sweep task {task_index} completed without a valid "
-                f"summary: {task['output_dir']}"
+                f"summary after {finalization_grace_seconds} seconds: "
+                f"{task['output_dir']}"
             )
         if (
             record["state"] == "UNKNOWN"
@@ -763,15 +809,33 @@ def main() -> None:
                             f"{spec.key} training exited unsuccessfully: "
                             f"{record}"
                         )
-                    _validate_checkpoint(
-                        _formal_run_dir(spec, int(job_id)),
-                        TRAIN_FINAL_STEP,
-                    )
-                    if metrics["max_step"] != TRAIN_FINAL_STEP:
-                        raise RuntimeError(
-                            f"{spec.key} metrics ended at "
-                            f"{metrics['max_step']}"
+                    ready, readiness_error = (
+                        _completed_training_readiness(
+                            _formal_run_dir(spec, int(job_id)),
+                            metrics,
+                            TRAIN_FINAL_STEP,
                         )
+                    )
+                    progress = state["training_progress"][spec.key]
+                    if not ready:
+                        if _within_finalization_grace(
+                            progress,
+                            now=time.time(),
+                            grace_seconds=(
+                                args.finalization_grace_seconds
+                            ),
+                        ):
+                            training_complete[spec.key] = False
+                            continue
+                        raise RuntimeError(
+                            f"{spec.key} training did not finalize within "
+                            f"{args.finalization_grace_seconds} seconds: "
+                            f"{readiness_error}"
+                        )
+                    progress.pop(
+                        "completion_observed_at_epoch",
+                        None,
+                    )
                     training_complete[spec.key] = True
                 else:
                     submitted_at = float(
@@ -794,7 +858,11 @@ def main() -> None:
             manifest = None
             if len(state["training_jobs"]) == len(TRAINING_SPECS):
                 manifest = _ensure_manifest(state)
-                _refresh_sweep_jobs(state, manifest)
+                _refresh_sweep_jobs(
+                    state,
+                    manifest,
+                    args.finalization_grace_seconds,
+                )
                 _submit_ready_sweep(
                     state,
                     manifest,

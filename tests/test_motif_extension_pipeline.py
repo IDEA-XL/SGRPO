@@ -64,6 +64,52 @@ class MotifExtensionPipelineTest(unittest.TestCase):
             ):
                 pipeline._read_jsonl_metrics(metrics_path, 2)
 
+    def test_completed_training_waits_for_final_metrics_visibility(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            run_dir = Path(temporary_dir)
+            _write_checkpoint(run_dir, 2000)
+
+            ready, reason = pipeline._completed_training_readiness(
+                run_dir,
+                {"max_step": 1990},
+                2000,
+            )
+            self.assertFalse(ready)
+            self.assertIn("metrics ended at 1990", reason)
+
+            ready, reason = pipeline._completed_training_readiness(
+                run_dir,
+                {"max_step": 2000},
+                2000,
+            )
+            self.assertTrue(ready)
+            self.assertEqual(reason, "")
+
+    def test_finalization_grace_is_bounded(self):
+        record = {}
+        self.assertTrue(
+            pipeline._within_finalization_grace(
+                record,
+                now=100.0,
+                grace_seconds=300,
+            )
+        )
+        self.assertEqual(record["completion_observed_at_epoch"], 100.0)
+        self.assertTrue(
+            pipeline._within_finalization_grace(
+                record,
+                now=400.0,
+                grace_seconds=300,
+            )
+        )
+        self.assertFalse(
+            pipeline._within_finalization_grace(
+                record,
+                now=400.1,
+                grace_seconds=300,
+            )
+        )
+
     def test_summary_validator_checks_hash_and_shape(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             output_dir = Path(temporary_dir) / "result"

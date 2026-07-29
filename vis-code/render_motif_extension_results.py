@@ -280,8 +280,14 @@ def _validate_point_summary(
 
 
 class MotifResultStore(dense.ResultStore):
-    def __init__(self, run_root: Path):
+    def __init__(
+        self,
+        run_root: Path,
+        *,
+        panel: dense.PanelSpec | None = None,
+    ):
         self.results_root = run_root
+        self.panel = PANEL if panel is None else panel
         self._cache = {}
         self._row_hashes = {}
         self._test_motifs = load_test_motif_records(
@@ -293,12 +299,16 @@ class MotifResultStore(dense.ResultStore):
                 f"missing motif sweep manifest: {manifest_path}"
             )
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("task_count") != 25:
-            raise ValueError("motif sweep manifest must contain 25 tasks")
+        expected_task_count = len(self.panel.models) * len(dense.SEEDS)
+        if manifest.get("task_count") != expected_task_count:
+            raise ValueError(
+                "motif sweep manifest task count mismatch: "
+                f"{manifest.get('task_count')!r} vs {expected_task_count}"
+            )
         if manifest.get("seeds") != list(dense.SEEDS):
             raise ValueError("motif sweep manifest has unexpected seeds")
         tasks = manifest.get("tasks")
-        if not isinstance(tasks, list) or len(tasks) != 25:
+        if not isinstance(tasks, list) or len(tasks) != expected_task_count:
             raise ValueError("motif sweep manifest has invalid tasks")
         self._tasks = {}
         for task in tasks:
@@ -308,7 +318,7 @@ class MotifResultStore(dense.ResultStore):
             self._tasks[key] = task
         expected_keys = {
             (model.source_id, seed)
-            for model in PANEL.models
+            for model in self.panel.models
             for seed in dense.SEEDS
         }
         if set(self._tasks) != expected_keys:
@@ -320,7 +330,7 @@ class MotifResultStore(dense.ResultStore):
         if seed in self._cache:
             return self._cache[seed]
         rows = []
-        for model in PANEL.models:
+        for model in self.panel.models:
             task = self._tasks[(model.source_id, seed)]
             if task.get("display_name") != model.label:
                 raise ValueError(
@@ -549,7 +559,7 @@ class MotifResultStore(dense.ResultStore):
     def validate_raw_seed_independence(self) -> None:
         for seed in dense.SEEDS:
             self.rows("denovo", seed)
-        for model in PANEL.models:
+        for model in self.panel.models:
             hashes = [
                 self._row_hashes[(model.source_id, seed)]
                 for seed in dense.SEEDS

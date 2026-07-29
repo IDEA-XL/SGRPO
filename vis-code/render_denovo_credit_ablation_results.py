@@ -17,17 +17,25 @@ SECTION_BEGIN = "<!-- BEGIN DENOVO CREDIT ABLATION RESULTS -->"
 SECTION_END = "<!-- END DENOVO CREDIT ABLATION RESULTS -->"
 EXPECTED_DIVERSITY_METRIC = "morgan_internal_diversity"
 SGRPO_MODEL_ID = "genmol_denovo_sgrpo_rewardsum_loo_2000"
+GRPO_MODEL_ID = "genmol_denovo_grpo_2000"
 EXTRA_MODEL_IDS = (
     "denovo_raw_loo_diversity_2000",
     "denovo_mean_baseline_2000",
     "denovo_mean_baseline_std_2000",
 )
+BASE_MODEL_IDS = (SGRPO_MODEL_ID, GRPO_MODEL_ID)
 
 SGRPO_MODEL = dense.ModelSpec(
     SGRPO_MODEL_ID,
     "SGRPO",
     dense.COLOR_SGRPO,
     "o",
+)
+GRPO_MODEL = dense.ModelSpec(
+    GRPO_MODEL_ID,
+    "GRPO",
+    dense.COLOR_GRPO,
+    "^",
 )
 RAW_LOO_MODEL = dense.ModelSpec(
     "denovo_raw_loo_diversity_2000",
@@ -63,13 +71,13 @@ PANELS = (
         title="Mean-Baseline Comparison",
         source_kind="denovo",
         models=(
-            SGRPO_MODEL,
+            GRPO_MODEL,
             MEAN_BASELINE_MODEL,
             MEAN_BASELINE_STD_MODEL,
         ),
     ),
 )
-ALL_MODEL_IDS = {SGRPO_MODEL_ID, *EXTRA_MODEL_IDS}
+ALL_MODEL_IDS = {*BASE_MODEL_IDS, *EXTRA_MODEL_IDS}
 
 
 class CreditAblationStore(dense.ResultStore):
@@ -100,15 +108,17 @@ class CreditAblationStore(dense.ResultStore):
             base_rows = json.loads(base_path.read_text())
             if not isinstance(extra_rows, list) or not isinstance(base_rows, list):
                 raise TypeError("De novo sweep summaries must be JSON lists")
-            sgrpo_rows = [
+            base_model_rows = [
                 row
                 for row in base_rows
-                if row.get("experiment") == SGRPO_MODEL_ID
+                if row.get("experiment") in BASE_MODEL_IDS
             ]
-            legacy_metrics = {row.get("diversity_metric") for row in sgrpo_rows}
+            legacy_metrics = {
+                row.get("diversity_metric") for row in base_model_rows
+            }
             if not legacy_metrics.issubset({None, EXPECTED_DIVERSITY_METRIC}):
                 raise ValueError(
-                    f"Seed {seed} SGRPO rows contain an unexpected diversity metric: "
+                    f"Seed {seed} base rows contain an unexpected diversity metric: "
                     f"{legacy_metrics}"
                 )
             if any(
@@ -118,7 +128,7 @@ class CreditAblationStore(dense.ResultStore):
                 raise ValueError(
                     f"Seed {seed} credit-ablation rows contain a non-Morgan metric"
                 )
-            self._cache[cache_key] = [*sgrpo_rows, *extra_rows]
+            self._cache[cache_key] = [*base_model_rows, *extra_rows]
         rows = self._cache[cache_key]
         expected = len(ALL_MODEL_IDS) * len(dense.MOLECULE_SWEEP)
         if len(rows) != expected:
@@ -248,9 +258,9 @@ def _result_section(
         "## GenMol De Novo: Credit-Baseline Ablation",
         "",
         "This is an additional five-run evaluation and does not replace any existing "
-        "result section. The paper SGRPO sweep and the three new credit-baseline "
-        "checkpoints use the standard GenMol De Novo protocol: QED/SA soft Utility, "
-        "Morgan-fingerprint internal Diversity, and the ten paired "
+        "result section. The paper SGRPO and GRPO sweeps and the three new "
+        "credit-baseline checkpoints use the standard GenMol De Novo protocol: "
+        "QED/SA soft Utility, Morgan-fingerprint internal Diversity, and the ten paired "
         "randomness-temperature sweep points. Results are divided into two independent "
         "comparison groups; no four-model joint metric is reported.",
         "",

@@ -29,37 +29,61 @@ from genmol.diversity import (  # noqa: E402
 from genmol.rl.motif import load_test_motif_records  # noqa: E402
 
 
-SECTION_BEGIN = "<!-- BEGIN MOTIF EXTENSION RESULTS -->"
-SECTION_END = "<!-- END MOTIF EXTENSION RESULTS -->"
 COLOR_DMB = "#6B5B95"
 COLOR_ENTROPY = "#C85A3E"
-PANEL = dense.PanelSpec(
-    key="motif_extension",
-    title="Motif Extension",
-    source_kind="denovo",
-    models=(
-        dense.ModelSpec(
-            "motif_original_genmol_v2",
-            "Original",
-            dense.COLOR_ORIGINAL,
-            "D",
+
+
+def _panel_for_checkpoint_step(checkpoint_step: int) -> dense.PanelSpec:
+    if checkpoint_step <= 0:
+        raise ValueError("checkpoint_step must be positive")
+    return dense.PanelSpec(
+        key="motif_extension",
+        title="Motif Extension",
+        source_kind="denovo",
+        models=(
+            dense.ModelSpec(
+                "motif_original_genmol_v2",
+                "Original",
+                dense.COLOR_ORIGINAL,
+                "D",
+            ),
+            dense.ModelSpec(
+                f"motif_grpo_{checkpoint_step}",
+                "GRPO",
+                dense.COLOR_GRPO,
+                "^",
+            ),
+            dense.ModelSpec(
+                f"motif_dmb_{checkpoint_step}",
+                "Diverse Mini-Batch GRPO",
+                COLOR_DMB,
+                "P",
+            ),
+            dense.ModelSpec(
+                f"motif_entropy_{checkpoint_step}",
+                "Entropy-Regularized GRPO",
+                COLOR_ENTROPY,
+                "X",
+            ),
+            dense.ModelSpec(
+                f"motif_sgrpo_{checkpoint_step}",
+                "SGRPO",
+                dense.COLOR_SGRPO,
+                "o",
+            ),
         ),
-        dense.ModelSpec("motif_grpo_2000", "GRPO", dense.COLOR_GRPO, "^"),
-        dense.ModelSpec(
-            "motif_dmb_2000",
-            "Diverse Mini-Batch GRPO",
-            COLOR_DMB,
-            "P",
-        ),
-        dense.ModelSpec(
-            "motif_entropy_2000",
-            "Entropy-Regularized GRPO",
-            COLOR_ENTROPY,
-            "X",
-        ),
-        dense.ModelSpec("motif_sgrpo_2000", "SGRPO", dense.COLOR_SGRPO, "o"),
-    ),
-)
+    )
+
+
+PANEL = _panel_for_checkpoint_step(2000)
+
+
+def _section_markers(checkpoint_step: int) -> tuple[str, str]:
+    suffix = "" if checkpoint_step == 2000 else f" CHECKPOINT {checkpoint_step}"
+    return (
+        f"<!-- BEGIN MOTIF EXTENSION{suffix} RESULTS -->",
+        f"<!-- END MOTIF EXTENSION{suffix} RESULTS -->",
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -595,13 +619,17 @@ def _plot_figure2(store: MotifResultStore, output_path: Path) -> None:
     plt.close(figure)
 
 
-def _section(store, metrics, references, figure_name):
+def _section(store, metrics, references, figure_name, checkpoint_step):
     points = ", ".join(
         f"({randomness:g}, {temperature:g})"
         for randomness, temperature in dense.MOLECULE_SWEEP
     )
     lines = [
-        "## GenMol Motif Extension",
+        (
+            "## GenMol Motif Extension"
+            if checkpoint_step == 2000
+            else f"## GenMol Motif Extension: Checkpoint {checkpoint_step}"
+        ),
         "",
         "| Sweep points | Runs | Test motifs | Generations per motif | Samples per point |",
         "|---|---:|---:|---:|---:|",
@@ -689,21 +717,22 @@ def _section(store, metrics, references, figure_name):
     return "\n".join(lines) + "\n"
 
 
-def _upsert(path: Path, section: str) -> None:
+def _upsert(path: Path, section: str, checkpoint_step: int) -> None:
     if not path.is_file():
         raise FileNotFoundError(f"expanded result Markdown not found: {path}")
+    section_begin, section_end = _section_markers(checkpoint_step)
     text = path.read_text()
-    begin_count = text.count(SECTION_BEGIN)
-    end_count = text.count(SECTION_END)
+    begin_count = text.count(section_begin)
+    end_count = text.count(section_end)
     if begin_count != end_count or begin_count > 1:
         raise RuntimeError(
             f"malformed motif result markers in {path}: "
             f"begin={begin_count} end={end_count}"
         )
-    wrapped = f"{SECTION_BEGIN}\n{section.rstrip()}\n{SECTION_END}\n"
+    wrapped = f"{section_begin}\n{section.rstrip()}\n{section_end}\n"
     if begin_count:
-        prefix, remainder = text.split(SECTION_BEGIN, 1)
-        _, suffix = remainder.split(SECTION_END, 1)
+        prefix, remainder = text.split(section_begin, 1)
+        _, suffix = remainder.split(section_end, 1)
         updated = prefix.rstrip() + "\n\n" + wrapped + suffix.lstrip()
     else:
         updated = text.rstrip() + "\n\n" + wrapped
@@ -711,11 +740,24 @@ def _upsert(path: Path, section: str) -> None:
 
 
 def main() -> None:
+    global PANEL
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--expanded-results-path", type=Path, required=True)
+    parser.add_argument("--expanded-results-path", type=Path)
+    parser.add_argument("--checkpoint-step", type=int)
     args = parser.parse_args()
+    manifest = json.loads((args.run_root / "manifest.json").read_text())
+    manifest_step = int(manifest.get("checkpoint_step", 2000))
+    checkpoint_step = (
+        manifest_step if args.checkpoint_step is None else args.checkpoint_step
+    )
+    if checkpoint_step != manifest_step:
+        raise ValueError(
+            "checkpoint step does not match manifest: "
+            f"argument={checkpoint_step} manifest={manifest_step}"
+        )
+    PANEL = _panel_for_checkpoint_step(checkpoint_step)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     store = MotifResultStore(args.run_root)
     store.validate_raw_seed_independence()
@@ -725,15 +767,26 @@ def main() -> None:
         include_denovo_auxiliary=False,
     )
     metrics, references = dense.table1_metrics(store, (PANEL,))
-    figure_path = args.output_dir / "figure2-motif-extension.pdf"
+    name_suffix = "" if checkpoint_step == 2000 else f"-checkpoint-{checkpoint_step}"
+    figure_path = args.output_dir / f"figure2-motif-extension{name_suffix}.pdf"
     _plot_figure2(store, figure_path)
-    section = _section(store, metrics, references, figure_path.name)
-    standalone = args.output_dir / "motif-extension-results.md"
+    section = _section(
+        store,
+        metrics,
+        references,
+        figure_path.name,
+        checkpoint_step,
+    )
+    standalone = (
+        args.output_dir / f"motif-extension-results{name_suffix}.md"
+    )
     standalone.write_text("# Motif-Extension Results\n\n" + section)
-    _upsert(args.expanded_results_path, section)
+    if args.expanded_results_path is not None:
+        _upsert(args.expanded_results_path, section, checkpoint_step)
     print(figure_path)
     print(standalone)
-    print(args.expanded_results_path)
+    if args.expanded_results_path is not None:
+        print(args.expanded_results_path)
 
 
 if __name__ == "__main__":

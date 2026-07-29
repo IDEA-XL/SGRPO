@@ -66,6 +66,19 @@ def _summary_row(rows_by_motif):
 
 
 class MotifExtensionRenderTest(unittest.TestCase):
+    def test_checkpoint_step_changes_trained_model_ids_only(self):
+        panel = MODULE._panel_for_checkpoint_step(700)
+        self.assertEqual(
+            [model.source_id for model in panel.models],
+            [
+                "motif_original_genmol_v2",
+                "motif_grpo_700",
+                "motif_dmb_700",
+                "motif_entropy_700",
+                "motif_sgrpo_700",
+            ],
+        )
+
     def test_raw_summary_validation_accepts_matching_aggregates(self):
         rows_by_motif = _rows_by_motif()
         model, checkpoint_path, summary = _summary_row(rows_by_motif)

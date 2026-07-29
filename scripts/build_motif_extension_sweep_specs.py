@@ -9,17 +9,26 @@ from pathlib import Path
 
 
 SEEDS = (42, 43, 44, 45, 46)
-MODELS = (
-    ("motif_original_genmol_v2", "Original", "original_checkpoint"),
-    ("motif_grpo_2000", "GRPO", "grpo_checkpoint"),
-    ("motif_dmb_2000", "Diverse Mini-Batch GRPO", "dmb_checkpoint"),
-    (
-        "motif_entropy_2000",
-        "Entropy-Regularized GRPO",
-        "entropy_checkpoint",
-    ),
-    ("motif_sgrpo_2000", "SGRPO", "sgrpo_checkpoint"),
-)
+
+
+def model_specs(checkpoint_step: int) -> tuple[tuple[str, str, str], ...]:
+    if checkpoint_step <= 0:
+        raise ValueError("checkpoint_step must be positive")
+    return (
+        ("motif_original_genmol_v2", "Original", "original_checkpoint"),
+        (f"motif_grpo_{checkpoint_step}", "GRPO", "grpo_checkpoint"),
+        (
+            f"motif_dmb_{checkpoint_step}",
+            "Diverse Mini-Batch GRPO",
+            "dmb_checkpoint",
+        ),
+        (
+            f"motif_entropy_{checkpoint_step}",
+            "Entropy-Regularized GRPO",
+            "entropy_checkpoint",
+        ),
+        (f"motif_sgrpo_{checkpoint_step}", "SGRPO", "sgrpo_checkpoint"),
+    )
 
 
 def main() -> None:
@@ -30,8 +39,10 @@ def main() -> None:
     parser.add_argument("--dmb-checkpoint", type=Path, required=True)
     parser.add_argument("--entropy-checkpoint", type=Path, required=True)
     parser.add_argument("--sgrpo-checkpoint", type=Path, required=True)
+    parser.add_argument("--checkpoint-step", type=int, default=2000)
     parser.add_argument("--allow-pending-checkpoints", action="store_true")
     args = parser.parse_args()
+    models = model_specs(args.checkpoint_step)
     if args.run_root.exists():
         raise FileExistsError(
             f"run root already exists; refusing to overwrite: {args.run_root}"
@@ -39,7 +50,7 @@ def main() -> None:
 
     checkpoint_by_field = {
         field: getattr(args, field)
-        for _, _, field in MODELS
+        for _, _, field in models
     }
     missing = [
         str(path)
@@ -55,7 +66,7 @@ def main() -> None:
     spec_dir.mkdir(parents=True)
     manifest_rows = []
     task_index = 0
-    for experiment, display_name, checkpoint_field in MODELS:
+    for experiment, display_name, checkpoint_field in models:
         checkpoint_path = checkpoint_by_field[checkpoint_field]
         for seed in SEEDS:
             output_dir = (
@@ -87,6 +98,7 @@ def main() -> None:
     manifest_path.write_text(
         json.dumps(
             {
+                "checkpoint_step": args.checkpoint_step,
                 "task_count": len(manifest_rows),
                 "seeds": list(SEEDS),
                 "tasks": manifest_rows,

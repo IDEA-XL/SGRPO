@@ -19,6 +19,15 @@ import render_rebuttal_dense_results as dense  # noqa: E402
 
 
 NON_RETAINED_UTILITY = -1.0
+VARIANT_MODELS = {
+    **comparison.VARIANT_MODELS,
+    "gw09": dense.ModelSpec(
+        "motif_sgrpo_1000",
+        "SGRPO (w=0.9)",
+        dense.COLOR_SGRPO,
+        "o",
+    ),
+}
 
 
 class RetentionPenalizedStore(dense.ResultStore):
@@ -151,27 +160,34 @@ def main() -> None:
     parser.add_argument("--variant-run-root", type=Path, required=True)
     parser.add_argument(
         "--variant",
-        choices=tuple(comparison.VARIANT_MODELS),
+        choices=tuple(VARIANT_MODELS),
         required=True,
     )
     parser.add_argument("--output-path", type=Path, required=True)
     args = parser.parse_args()
 
-    variant_model = comparison.VARIANT_MODELS[args.variant]
+    variant_model = VARIANT_MODELS[args.variant]
     base_store = motif.MotifResultStore(
         args.base_run_root,
         panel=comparison.BASE_PANEL,
     )
     base_store.validate_raw_seed_independence()
-    variant_panel = comparison._single_model_panel(
-        args.variant,
-        variant_model,
-    )
-    variant_store = motif.MotifResultStore(
-        args.variant_run_root,
-        panel=variant_panel,
-    )
-    variant_store.validate_raw_seed_independence()
+    if args.variant == "gw09":
+        if args.variant_run_root.resolve() != args.base_run_root.resolve():
+            raise ValueError(
+                "gw09 must use the checkpoint-1000 base sweep root"
+            )
+        variant_store = base_store
+    else:
+        variant_panel = comparison._single_model_panel(
+            args.variant,
+            variant_model,
+        )
+        variant_store = motif.MotifResultStore(
+            args.variant_run_root,
+            panel=variant_panel,
+        )
+        variant_store.validate_raw_seed_independence()
 
     store = RetentionPenalizedStore(
         base_store,
